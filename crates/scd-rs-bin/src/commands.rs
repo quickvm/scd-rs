@@ -4,8 +4,12 @@
 //! trace (see `docs/required-commands.md` and `docs/assuan-traces/`).
 
 use scd_rs_assuan::{CommandHandler, Connection, HandlerError};
-use scd_rs_card::{enumerate_cards, read_card_info, CardInfo, KeyInfo, KeyUsage};
+use scd_rs_card::{
+    decrypt, enumerate_cards, read_card_info, sign_digest_info, CardInfo, KeyInfo, KeyUsage,
+};
+use secrecy::ExposeSecret;
 
+use crate::pinentry::{build_prompt, request_pin};
 use crate::state::{KnownKeys, Session};
 
 /// Assuan error codes mirrored from gpg-agent / scdaemon.
@@ -18,7 +22,6 @@ mod err {
     pub const INV_ARG: u32 = 100_663_349;
     pub const NO_CARD: u32 = 100_663_361;
     pub const NO_SECRET_KEY: u32 = 100_663_313;
-    pub const NOT_IMPLEMENTED: u32 = 100_663_378;
 }
 
 /// The root command dispatcher.
@@ -42,11 +45,8 @@ impl CommandHandler for ScdHandler {
             "KEYINFO" => keyinfo(session, conn, args).await,
             "GETATTR" => getattr(session, conn, args).await,
             "SETDATA" => setdata(session, args),
-            "PKSIGN" => Err(HandlerError::new(err::NOT_IMPLEMENTED, "PKSIGN not yet wired")),
-            "PKDECRYPT" => Err(HandlerError::new(
-                err::NOT_IMPLEMENTED,
-                "PKDECRYPT not yet wired",
-            )),
+            "PKSIGN" => pksign(session, conn, args).await,
+            "PKDECRYPT" => pkdecrypt(session, conn, args).await,
             _ => Err(HandlerError::new(
                 err::NOT_SUPPORTED,
                 format!("unknown command: {verb}"),
@@ -334,6 +334,96 @@ fn setdata(session: &mut Session, args: &str) -> Result<(), HandlerError> {
         session.setdata = parse(hex_body)?;
     }
     Ok(())
+}
+
+async fn pksign(
+    session: &mut Session,
+    conn: &mut Connection,
+    args: &str,
+) -> Result<(), HandlerError> {
+    // gpg-agent sends `--hash=<algo> <keygrip>`; we only use the keygrip for
+    // routing (the hash is encoded in the DigestInfo we already have).
+    let keygrip = args
+        .split_whitespace()
+        .last()
+        .ok_or_else(|| HandlerError::new(err::INV_ARG, "PKSIGN requires keygrip"))?;
+    let usage = resolve_key(session, keygrip)?;
+    if usage != KeyUsage::Signing && usage != KeyUsage::Authentication {
+        return Err(HandlerError::new(
+            err::INV_ARG,
+            format!("keygrip {keygrip} is not a signing key"),
+        ));
+    }
+    let digest_info = session.take_data();
+    if digest_info.is_empty() {
+        return Err(HandlerError::new(err::INV_ARG, "no SETDATA buffered"));
+    }
+    let ident = require_ident(session)?;
+    let info = read_card_info(&ident).map_err(card_err)?;
+    let prompt = build_prompt(info.ident.as_ref(), info.cardholder_name.as_deref(), Some(info.sig_counter));
+
+    let pin = request_pin(conn, &prompt)
+        .await
+        .map_err(|e| handler_io(&e))?;
+    let signature =
+        sign_digest_info(&ident, pin.expose_secret(), &digest_info).map_err(card_err)?;
+    conn.write_data(&signature)
+        .await
+        .map_err(|e| handler_io(&e))?;
+    Ok(())
+}
+
+async fn pkdecrypt(
+    session: &mut Session,
+    conn: &mut Connection,
+    args: &str,
+) -> Result<(), HandlerError> {
+    let keygrip = args.trim();
+    let usage = resolve_key(session, keygrip)?;
+    if usage != KeyUsage::Decryption {
+        return Err(HandlerError::new(
+            err::INV_ARG,
+            format!("keygrip {keygrip} is not a decryption key"),
+        ));
+    }
+    let ciphertext = session.take_data();
+    if ciphertext.is_empty() {
+        return Err(HandlerError::new(err::INV_ARG, "no SETDATA buffered"));
+    }
+    let ident = require_ident(session)?;
+    let info = read_card_info(&ident).map_err(card_err)?;
+    let prompt = build_prompt(info.ident.as_ref(), info.cardholder_name.as_deref(), None);
+
+    let pin = request_pin(conn, &prompt)
+        .await
+        .map_err(|e| handler_io(&e))?;
+    let plaintext =
+        decrypt(&ident, pin.expose_secret(), &ciphertext).map_err(card_err)?;
+    // gpg-agent expects the PADDING status line before the plaintext.
+    status(conn, "PADDING", "0").await?;
+    conn.write_data(&plaintext)
+        .await
+        .map_err(|e| handler_io(&e))?;
+    Ok(())
+}
+
+fn resolve_key(session: &mut Session, keygrip: &str) -> Result<KeyUsage, HandlerError> {
+    let grip = keygrip.to_ascii_uppercase();
+    if let Some(usage) = session.known_keys.usage(&grip) {
+        return Ok(usage);
+    }
+    // Fall back to reloading from the card.
+    let ident = require_ident(session)?;
+    let info = read_card_info(&ident).map_err(card_err)?;
+    let usage = info
+        .keys
+        .iter()
+        .find(|k| k.keygrip.as_deref() == Some(grip.as_str()))
+        .map(|k| k.usage);
+    session.known_keys = KnownKeys::from_card_info(&info);
+    usage.ok_or_else(|| {
+        HandlerError::new(err::NO_SECRET_KEY, format!("unknown keygrip {keygrip}"))
+    })
 }
 
 fn require_ident(session: &Session) -> Result<String, HandlerError> {

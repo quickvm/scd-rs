@@ -7,7 +7,9 @@
 
 use std::fmt;
 
+use card_backend::CardBackend;
 use card_backend_pcsc::PcscBackend;
+use openpgp_card::Card as OcCard;
 use openpgp_card_sequoia::state::{Open, Transaction};
 use openpgp_card_sequoia::types::{Error as OcError, KeyType, StatusBytes};
 use openpgp_card_sequoia::Card;
@@ -389,4 +391,65 @@ fn manufacturer_name(id: u16) -> String {
         0x000F => "Nitrokey".into(),
         other => format!("0x{other:04X}"),
     }
+}
+
+/// Compute an RSA signature via `PSO: COMPUTE DIGITAL SIGNATURE`.
+///
+/// `digest_info` is the pre-built PKCS#1 `DigestInfo` structure (what
+/// `gpg-agent` places in `SETDATA`). The card wraps it in PKCS#1 padding
+/// internally and returns the raw signature bytes.
+///
+/// Uses `openpgp-card` directly rather than the Sequoia wrapper because
+/// the wrapper's `Signer` insists on rebuilding a `DigestInfo` from a raw
+/// hash — we already have the exact bytes `gpg-agent` wants the card to
+/// sign.
+#[instrument(level = "debug", skip(pin, digest_info), fields(ident))]
+pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<Vec<u8>> {
+    with_low_level_card(ident, |txn| {
+        txn.verify_pw1_sign(pin)?;
+        let sig = txn.pso_compute_digital_signature(digest_info.to_vec())?;
+        Ok(sig)
+    })
+}
+
+/// Decrypt a ciphertext via `PSO: DECIPHER`.
+///
+/// `ciphertext` is the payload `gpg-agent` placed in `SETDATA` (for RSA:
+/// the raw padded block, optionally preceded by a 1-byte algo hint that
+/// scdaemon forwards verbatim). The card returns the unpadded plaintext.
+#[instrument(level = "debug", skip(pin, ciphertext), fields(ident))]
+pub fn decrypt(ident: &str, pin: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    with_low_level_card(ident, |txn| {
+        txn.verify_pw1_user(pin)?;
+        let plain = txn.pso_decipher(ciphertext.to_vec())?;
+        Ok(plain)
+    })
+}
+
+fn with_low_level_card<R, F>(ident: &str, f: F) -> Result<R>
+where
+    F: FnOnce(&mut openpgp_card::Transaction<'_>) -> Result<R>,
+{
+    let short = short_ident_from_full(ident)?;
+    let backends = PcscBackend::card_backends(None).map_err(|e| CardError::Pcsc {
+        message: e.to_string(),
+        retryable: true,
+    })?;
+    for backend in backends {
+        let backend: Box<dyn CardBackend + Send + Sync> = backend.map_err(|e| CardError::Pcsc {
+            message: e.to_string(),
+            retryable: true,
+        })?;
+        let mut card = OcCard::new(backend)?;
+        let mut txn = card.transaction()?;
+        let app_id = txn.application_identifier()?;
+        if app_id.ident().eq_ignore_ascii_case(&short) {
+            debug!("card matched, running low-level op");
+            let out = f(&mut txn);
+            drop(txn);
+            drop(card);
+            return out;
+        }
+    }
+    Err(CardError::NotFound)
 }

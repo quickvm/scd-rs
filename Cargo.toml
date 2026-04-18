@@ -15,11 +15,13 @@ repository = "https://github.com/jdoss/scd-rs-agent"
 authors = ["Josh Doss <contact@inf7.net>"]
 
 [workspace.dependencies]
+card-backend = "0.2"
 card-backend-pcsc = "0.5.1"
+openpgp-card = "0.4"
 openpgp-card-sequoia = "0.2.2"
 sequoia-openpgp = { version = "1.22", default-features = false, features = ["crypto-nettle"] }
 sha1 = "0.11"
-tokio = { version = "1.52", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.52", features = ["net", "io-std", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 thiserror = "2.0"

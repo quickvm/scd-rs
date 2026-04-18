@@ -1555,7 +1555,9 @@ dependencies = [
 name = "scd-rs-card"
 version = "0.1.0"
 dependencies = [
+ "card-backend",
  "card-backend-pcsc",
+ "openpgp-card",
  "openpgp-card-sequoia",
  "secrecy",
  "sequoia-openpgp",
