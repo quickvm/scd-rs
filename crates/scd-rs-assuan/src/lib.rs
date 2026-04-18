@@ -9,4 +9,4 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 
-pub use server::{AssuanServer, CommandHandler, Connection, HandlerError, ServerError};
+pub use server::{serve_stdio, AssuanServer, CommandHandler, Connection, HandlerError, ServerError};

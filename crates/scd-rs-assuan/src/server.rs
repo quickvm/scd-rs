@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::framing::encode_data_lines;
@@ -42,6 +42,12 @@ pub enum ServerError {
     Protocol(#[from] ProtocolError),
     #[error("bind path already exists: {}", .0.display())]
     PathInUse(PathBuf),
+    #[error("peer sent CAN during INQUIRE")]
+    InquireCancelled,
+    #[error("peer sent unexpected line during INQUIRE: {0:?}")]
+    InquireUnexpected(ClientLine),
+    #[error("peer closed during INQUIRE")]
+    InquireEof,
 }
 
 /// Trait implemented by downstream crates to dispatch Assuan commands.
@@ -67,20 +73,38 @@ pub trait CommandHandler: Send + Sync + 'static {
     }
 }
 
+type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
+type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
 /// One live Assuan session. Handlers receive a mutable reference to this
 /// and use the `write_*` methods to emit status, data, and completion lines.
 pub struct Connection {
-    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: tokio::net::unix::OwnedWriteHalf,
+    reader: BufReader<BoxedReader>,
+    writer: BoxedWriter,
 }
 
 impl Connection {
-    fn new(stream: UnixStream) -> Self {
+    fn from_unix_stream(stream: UnixStream) -> Self {
         let (read, write) = stream.into_split();
+        Self::new(Box::new(read), Box::new(write))
+    }
+
+    #[must_use]
+    pub fn new(reader: BoxedReader, writer: BoxedWriter) -> Self {
         Self {
-            reader: BufReader::new(read),
-            writer: write,
+            reader: BufReader::new(reader),
+            writer,
         }
+    }
+
+    /// Wrap the current process's stdin/stdout. Used for scdaemon-compat
+    /// server mode where `gpg-agent` spawns us and talks over pipes.
+    #[must_use]
+    pub fn from_stdio() -> Self {
+        Self::new(
+            Box::new(tokio::io::stdin()),
+            Box::new(tokio::io::stdout()),
+        )
     }
 
     /// Read one line and parse it. `Ok(None)` signals EOF (peer closed).
@@ -128,6 +152,37 @@ impl Connection {
         Ok(())
     }
 
+    /// Send `INQUIRE <keyword>[ <args>]` and collect the peer's `D` lines
+    /// into a single byte buffer, terminated by `END`. Returns the decoded
+    /// payload.
+    ///
+    /// The caller is responsible for zeroising the returned bytes if they
+    /// contain secret material (e.g. a PIN).
+    pub async fn inquire(
+        &mut self,
+        keyword: &str,
+        args: &str,
+    ) -> Result<Vec<u8>, ServerError> {
+        if args.is_empty() {
+            self.write_line(format!("INQUIRE {keyword}\n").as_bytes()).await?;
+        } else {
+            self.write_line(format!("INQUIRE {keyword} {args}\n").as_bytes())
+                .await?;
+        }
+        let mut payload = Vec::new();
+        loop {
+            let Some(line) = self.read_line().await? else {
+                return Err(ServerError::InquireEof);
+            };
+            match line {
+                ClientLine::Data(bytes) => payload.extend(bytes),
+                ClientLine::End => return Ok(payload),
+                ClientLine::Cancel => return Err(ServerError::InquireCancelled),
+                other => return Err(ServerError::InquireUnexpected(other)),
+            }
+        }
+    }
+
     async fn write_line(&mut self, bytes: &[u8]) -> Result<(), ServerError> {
         self.writer.write_all(bytes).await?;
         self.writer.flush().await?;
@@ -170,12 +225,21 @@ impl<H: CommandHandler> AssuanServer<H> {
             let (stream, _peer) = self.listener.accept().await?;
             let handler = Arc::clone(&self.handler);
             tokio::spawn(async move {
-                if let Err(e) = drive_session(stream, handler).await {
+                let conn = Connection::from_unix_stream(stream);
+                if let Err(e) = drive_session(conn, handler).await {
                     tracing::warn!(error = %e, "session ended with error");
                 }
             });
         }
     }
+}
+
+/// Drive one Assuan session over stdin/stdout, then return. Used for
+/// scdaemon-compat server mode where `gpg-agent` invokes us as a child
+/// process via `assuan_pipe_connect`.
+pub async fn serve_stdio<H: CommandHandler>(handler: H) -> Result<(), ServerError> {
+    let conn = Connection::from_stdio();
+    drive_session(conn, Arc::new(handler)).await
 }
 
 impl<H> Drop for AssuanServer<H> {
@@ -185,10 +249,9 @@ impl<H> Drop for AssuanServer<H> {
 }
 
 async fn drive_session<H: CommandHandler>(
-    stream: UnixStream,
+    mut conn: Connection,
     handler: Arc<H>,
 ) -> Result<(), ServerError> {
-    let mut conn = Connection::new(stream);
     let mut session = H::Session::default();
 
     // Assuan servers send an initial OK on connect, per the spec.
