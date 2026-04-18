@@ -186,11 +186,13 @@ fn print_key(k: &KeyInfo) {
     let slot = k.usage.openpgp_slot();
     match (&k.fingerprint, &k.algorithm, k.created) {
         (Some(fp), Some(algo), Some(created)) => {
+            let grip = k.keygrip.as_deref().unwrap_or("<none>");
             println!(
-                "key OPENPGP.{} ({}): {} {} created={}",
+                "key OPENPGP.{} ({}): fpr={} grip={} algo={} created={}",
                 slot,
                 k.usage.scd_usage(),
                 fp,
+                grip,
                 algo,
                 created
             );

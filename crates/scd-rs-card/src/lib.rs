@@ -14,6 +14,10 @@ use openpgp_card_sequoia::Card;
 use thiserror::Error;
 use tracing::{debug, instrument};
 
+mod keygrip;
+
+pub use keygrip::{format_hex, rsa_keygrip};
+
 /// Card application identifier in uppercase hex form, e.g.
 /// `D276000124010304000FE9B8A8420000`. This matches the format `gpg-agent`
 /// uses for `SERIALNO` responses.
@@ -353,13 +357,30 @@ fn key_info(txn: &mut Card<Transaction<'_>>, usage: KeyUsage) -> Result<KeyInfo>
         .ok()
         .map(|a| a.to_string());
 
+    let keygrip = txn
+        .public_key(key_type)
+        .ok()
+        .flatten()
+        .and_then(|pk| compute_keygrip(&pk));
+
     Ok(KeyInfo {
         usage,
-        keygrip: None,
+        keygrip,
         fingerprint,
         created,
         algorithm,
     })
+}
+
+fn compute_keygrip(pk: &openpgp_card_sequoia::PublicKey) -> Option<String> {
+    use sequoia_openpgp::crypto::mpi::PublicKey;
+    match pk.mpis() {
+        PublicKey::RSA { n, .. } => {
+            let grip = keygrip::rsa_keygrip(n.value());
+            Some(keygrip::format_hex(&grip))
+        }
+        _ => None,
+    }
 }
 
 fn manufacturer_name(id: u16) -> String {

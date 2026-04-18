@@ -11,6 +11,8 @@ authors.workspace = true
 [dependencies]
 card-backend-pcsc = { workspace = true }
 openpgp-card-sequoia = { workspace = true }
+sequoia-openpgp = { workspace = true }
+sha1 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 secrecy = { workspace = true }
