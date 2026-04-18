@@ -15,7 +15,6 @@ repository = "https://github.com/jdoss/scd-rs-agent"
 authors = ["Josh Doss <contact@inf7.net>"]
 
 [workspace.dependencies]
-openpgp-card = "0.6.1"
 card-backend-pcsc = "0.5.1"
 openpgp-card-sequoia = "0.2.2"
 tokio = { version = "1.52", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }

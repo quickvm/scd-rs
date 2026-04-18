@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-openpgp-card = { workspace = true }
 card-backend-pcsc = { workspace = true }
 openpgp-card-sequoia = { workspace = true }
 thiserror = { workspace = true }
