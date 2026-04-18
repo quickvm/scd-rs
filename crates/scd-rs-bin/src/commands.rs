@@ -132,8 +132,10 @@ async fn emit_learn_status(conn: &mut Connection, info: &CardInfo) -> Result<(),
         conn,
         "CHV-STATUS",
         &format!(
+            // First digit mirrors stock scdaemon: 1 = PW1 valid for multiple
+            // PSO:CDS operations, 0 = single-use ("Signature PIN: forced").
             "+{}+{}+{}+{}+{}+{}+{}",
-            u8::from(!info.chv_status.signing_pin_multi_op),
+            u8::from(info.chv_status.signing_pin_multi_op),
             info.chv_status.pw1_max_len,
             info.chv_status.rc_max_len,
             info.chv_status.pw3_max_len,
