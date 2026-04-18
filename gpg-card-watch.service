@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch GPG smartcard state and log failures
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/home/jdoss/src/personal/scd-rs-agent/gpg-card-watch.sh
+Environment=INTERVAL=10
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

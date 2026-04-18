@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Claude
+Exec=/home/jdoss/src/personal/scd-rs-agent/claude-desktop-no-pcsc.sh %u
+Icon=claude-desktop
+Type=Application
+Terminal=false
+Categories=Office;Utility;
+MimeType=x-scheme-handler/claude;
+StartupWMClass=Claude
