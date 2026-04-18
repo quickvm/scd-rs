@@ -35,10 +35,11 @@ impl CommandHandler for ScdHandler {
     /// the keygrip cache, but preserve the PIN cache so subsequent sign/
     /// decrypt operations don't re-prompt the user within the TTL window.
     fn reset_session(&self, session: &mut Session) {
+        // RESTART ends a logical flow (card-status → sign → decrypt), so only
+        // the per-flow buffer needs clearing. Card identity, enumerated keys,
+        // cached metadata, and the PIN are all still valid for the next flow
+        // and are expensive to rebuild, so we keep them.
         session.setdata.clear();
-        session.known_keys = KnownKeys::default();
-        session.current_ident = None;
-        // Intentionally keep cached_pin — that's the whole point of caching.
     }
 
     async fn handle(
@@ -110,8 +111,27 @@ const GPG_VERSION_COMPAT: &str = "2.4.9";
 async fn serialno(
     session: &mut Session,
     conn: &mut Connection,
-    _args: &str,
+    args: &str,
 ) -> Result<(), HandlerError> {
+    // gpg-agent issues SERIALNO and SERIALNO --all repeatedly during every
+    // sign/decrypt flow to re-confirm the card is still present. Re-opening
+    // the PC/SC context each time costs ~1 second on the Nitrokey. If we
+    // already bound a card in this session, emit the cached ident and skip
+    // the enumeration; if the card has actually been pulled, the next real
+    // card operation will return a PC/SC error and we'll reconcile.
+    //
+    // `SERIALNO --reset` (not yet used by our gpg-agent) should force a real
+    // enumeration.
+    let force_reset = args.split_whitespace().any(|t| t == "--reset");
+    if !force_reset {
+        if let Some(ident) = &session.current_ident {
+            conn.write_status("SERIALNO", ident)
+                .await
+                .map_err(|e| handler_io(&e))?;
+            tracing::info!("SERIALNO served from session");
+            return Ok(());
+        }
+    }
     let idents = enumerate_cards().map_err(card_err)?;
     let chosen = idents.into_iter().next().ok_or_else(|| {
         HandlerError::new(err::NO_CARD, "no OpenPGP card present")
@@ -119,6 +139,10 @@ async fn serialno(
     conn.write_status("SERIALNO", chosen.as_ref())
         .await
         .map_err(|e| handler_io(&e))?;
+    if session.current_ident.as_deref() != Some(chosen.as_ref()) {
+        session.cached_info = None;
+        session.known_keys = KnownKeys::default();
+    }
     session.current_ident = Some(chosen.0);
     Ok(())
 }
@@ -128,11 +152,33 @@ async fn learn(
     conn: &mut Connection,
     _args: &str,
 ) -> Result<(), HandlerError> {
+    // LEARN --force semantically refreshes card state; always re-read.
+    let info = refresh_card_info(session)?;
+    emit_learn_status(conn, &info).await?;
+    Ok(())
+}
+
+/// Return the session's cached `CardInfo`, populating it on first access.
+/// Subsequent callers within the same session reuse the cached snapshot,
+/// which cuts several seconds off sign and decrypt flows.
+fn ensure_card_info(session: &mut Session) -> Result<&CardInfo, HandlerError> {
+    if session.cached_info.is_none() {
+        tracing::info!("CardInfo cache miss — refreshing from card");
+        let _ = refresh_card_info(session)?;
+    } else {
+        tracing::info!("CardInfo cache hit");
+    }
+    Ok(session.cached_info.as_ref().expect("just populated"))
+}
+
+/// Force a fresh read from the card, updating both the info cache and the
+/// keygrip map.
+fn refresh_card_info(session: &mut Session) -> Result<CardInfo, HandlerError> {
     let ident = require_ident(session)?;
     let info = read_card_info(&ident).map_err(card_err)?;
-    emit_learn_status(conn, &info).await?;
     session.known_keys = KnownKeys::from_card_info(&info);
-    Ok(())
+    session.cached_info = Some(info.clone());
+    Ok(info)
 }
 
 async fn emit_learn_status(conn: &mut Connection, info: &CardInfo) -> Result<(), HandlerError> {
@@ -249,8 +295,7 @@ async fn keyinfo_list(
     conn: &mut Connection,
     filter: &str,
 ) -> Result<(), HandlerError> {
-    let ident = require_ident(session)?;
-    let info = read_card_info(&ident).map_err(card_err)?;
+    let info = ensure_card_info(session)?.clone();
     for key in &info.keys {
         let matches = match filter {
             "" => true,
@@ -282,7 +327,6 @@ async fn keyinfo_list(
         .await
         .map_err(|e| handler_io(&e))?;
     }
-    session.known_keys = KnownKeys::from_card_info(&info);
     Ok(())
 }
 
@@ -292,23 +336,22 @@ async fn keyinfo_single(
     keygrip: &str,
 ) -> Result<(), HandlerError> {
     let keygrip_upper = keygrip.to_ascii_uppercase();
-    let usage = session.known_keys.usage(&keygrip_upper).or_else(|| {
-        // Reload in case the session doesn't have it cached yet.
-        let ident = session.current_ident.as_ref()?;
-        let info = read_card_info(ident).ok()?;
-        let usage = info
+    let usage = if let Some(u) = session.known_keys.usage(&keygrip_upper) {
+        u
+    } else {
+        let info = ensure_card_info(session)?;
+        let Some(found) = info
             .keys
             .iter()
             .find(|k| k.keygrip.as_deref() == Some(keygrip_upper.as_str()))
-            .map(|k| k.usage);
-        session.known_keys = KnownKeys::from_card_info(&info);
-        usage
-    });
-    let Some(usage) = usage else {
-        return Err(HandlerError::new(
-            err::NO_SECRET_KEY,
-            format!("unknown keygrip {keygrip}"),
-        ));
+            .map(|k| k.usage)
+        else {
+            return Err(HandlerError::new(
+                err::NO_SECRET_KEY,
+                format!("unknown keygrip {keygrip}"),
+            ));
+        };
+        found
     };
     let ident = session
         .known_keys
@@ -334,8 +377,7 @@ async fn getattr(
     conn: &mut Connection,
     args: &str,
 ) -> Result<(), HandlerError> {
-    let ident = require_ident(session)?;
-    let info = read_card_info(&ident).map_err(card_err)?;
+    let info = ensure_card_info(session)?.clone();
     match args {
         "KEY-ATTR" => {
             for (idx, key) in info.keys.iter().enumerate() {
@@ -463,9 +505,7 @@ async fn pksign(
         return Err(HandlerError::new(err::INV_ARG, "no SETDATA buffered"));
     }
     let ident = require_ident(session)?;
-    let info = read_card_info(&ident).map_err(card_err)?;
-    let prompt = build_prompt(info.ident.as_ref(), info.cardholder_name.as_deref(), Some(info.sig_counter));
-
+    let (prompt, _) = prompt_for_card(session, /* include_counter = */ true)?;
     let signature = sign_with_cached_pin(session, conn, &ident, &digest_info, &prompt).await?;
     conn.write_data(&signature)
         .await
@@ -536,9 +576,7 @@ async fn pkdecrypt(
         return Err(HandlerError::new(err::INV_ARG, "no SETDATA buffered"));
     }
     let ident = require_ident(session)?;
-    let info = read_card_info(&ident).map_err(card_err)?;
-    let prompt = build_prompt(info.ident.as_ref(), info.cardholder_name.as_deref(), None);
-
+    let (prompt, _) = prompt_for_card(session, /* include_counter = */ false)?;
     let plaintext = decrypt_with_cached_pin(session, conn, &ident, &ciphertext, &prompt).await?;
     // gpg-agent expects the PADDING status line before the plaintext.
     status(conn, "PADDING", "0").await?;
@@ -583,18 +621,35 @@ fn resolve_key(session: &mut Session, keygrip: &str) -> Result<KeyUsage, Handler
     if let Some(usage) = session.known_keys.usage(&grip) {
         return Ok(usage);
     }
-    // Fall back to reloading from the card.
-    let ident = require_ident(session)?;
-    let info = read_card_info(&ident).map_err(card_err)?;
-    let usage = info
-        .keys
+    // Fall back to the cached info; refresh only if the cache is empty.
+    let info = ensure_card_info(session)?;
+    info.keys
         .iter()
         .find(|k| k.keygrip.as_deref() == Some(grip.as_str()))
-        .map(|k| k.usage);
-    session.known_keys = KnownKeys::from_card_info(&info);
-    usage.ok_or_else(|| {
-        HandlerError::new(err::NO_SECRET_KEY, format!("unknown keygrip {keygrip}"))
-    })
+        .map(|k| k.usage)
+        .ok_or_else(|| {
+            HandlerError::new(err::NO_SECRET_KEY, format!("unknown keygrip {keygrip}"))
+        })
+}
+
+/// Build the pinentry prompt string from cached card info. Returns the
+/// prompt plus the card ident we pulled it from, for callers that want to
+/// assert they match the session's current ident.
+fn prompt_for_card(
+    session: &mut Session,
+    include_counter: bool,
+) -> Result<(String, String), HandlerError> {
+    let info = ensure_card_info(session)?;
+    let prompt = build_prompt(
+        info.ident.as_ref(),
+        info.cardholder_name.as_deref(),
+        if include_counter {
+            Some(info.sig_counter)
+        } else {
+            None
+        },
+    );
+    Ok((prompt, info.ident.to_string()))
 }
 
 fn require_ident(session: &Session) -> Result<String, HandlerError> {

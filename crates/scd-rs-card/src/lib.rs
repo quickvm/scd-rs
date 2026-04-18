@@ -405,19 +405,31 @@ fn manufacturer_name(id: u16) -> String {
 /// sign.
 #[instrument(level = "debug", skip(pin, digest_info), fields(ident, pin_len = pin.len(), di_len = digest_info.len()))]
 pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<Vec<u8>> {
-    with_low_level_card(ident, |txn| {
+    let t_overall = std::time::Instant::now();
+    let result = with_low_level_card(ident, |txn| {
+        let t_verify = std::time::Instant::now();
         txn.verify_pw1_sign(pin).map_err(|e| {
             tracing::error!(error = %e, "verify_pw1_sign failed");
             e
         })?;
-        debug!("PIN verified; sending PSO:CDS");
+        tracing::debug!(
+            verify_ms = t_verify.elapsed().as_millis() as u64,
+            "PIN verified; sending PSO:CDS"
+        );
+        let t_cds = std::time::Instant::now();
         let sig = txn.pso_compute_digital_signature(digest_info.to_vec()).map_err(|e| {
             tracing::error!(error = %e, "pso_compute_digital_signature failed");
             e
         })?;
-        debug!(sig_len = sig.len(), "signature returned");
+        tracing::debug!(
+            cds_ms = t_cds.elapsed().as_millis() as u64,
+            sig_len = sig.len(),
+            "signature returned"
+        );
         Ok(sig)
-    })
+    });
+    tracing::info!(total_ms = t_overall.elapsed().as_millis() as u64, "sign_digest_info finished");
+    result
 }
 
 /// Decrypt a ciphertext via `PSO: DECIPHER`.
@@ -447,25 +459,34 @@ where
     F: FnOnce(&mut openpgp_card::Transaction<'_>) -> Result<R>,
 {
     let short = short_ident_from_full(ident)?;
+    let t_ctx = std::time::Instant::now();
     let backends = PcscBackend::card_backends(None).map_err(|e| CardError::Pcsc {
         message: e.to_string(),
         retryable: true,
     })?;
+    let mut enum_ms: u64 = t_ctx.elapsed().as_millis() as u64;
     for backend in backends {
         let backend: Box<dyn CardBackend + Send + Sync> = backend.map_err(|e| CardError::Pcsc {
             message: e.to_string(),
             retryable: true,
         })?;
+        let t_open = std::time::Instant::now();
         let mut card = OcCard::new(backend)?;
+        let open_ms = t_open.elapsed().as_millis() as u64;
         let mut txn = card.transaction()?;
         let app_id = txn.application_identifier()?;
         if app_id.ident().eq_ignore_ascii_case(&short) {
-            debug!("card matched, running low-level op");
+            tracing::debug!(
+                ctx_ms = enum_ms,
+                open_ms,
+                "card matched, running low-level op"
+            );
             let out = f(&mut txn);
             drop(txn);
             drop(card);
             return out;
         }
+        enum_ms = enum_ms.saturating_add(open_ms);
     }
     Err(CardError::NotFound)
 }

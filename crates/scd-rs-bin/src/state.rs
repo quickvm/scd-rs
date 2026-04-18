@@ -113,6 +113,11 @@ pub struct Session {
     pub known_keys: KnownKeys,
     /// In-memory PIN cache. Cleared on RESTART and on bad-PIN errors.
     pub cached_pin: Option<CachedPin>,
+    /// Cached `CardInfo` from the last card read. Used to serve prompt
+    /// building, cardholder display, and signature-counter lookups without
+    /// re-reading the card (each `read_card_info` costs ~3 seconds of
+    /// round-trips). Refreshed explicitly on SERIALNO and LEARN --force.
+    pub cached_info: Option<CardInfo>,
 }
 
 impl Session {
