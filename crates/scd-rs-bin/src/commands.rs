@@ -539,18 +539,6 @@ async fn sign_with_cached_pin(
     let pin = request_pin(conn, prompt)
         .await
         .map_err(|e| handler_io(&e))?;
-
-    if std::env::var_os("SCD_RS_DRY_SIGN").is_some_and(|v| !v.is_empty()) {
-        tracing::warn!(
-            pin_len_after_trim = pin.expose_secret().len(),
-            "DRY_SIGN: skipping card verify",
-        );
-        return Err(HandlerError::new(
-            err::GENERAL,
-            "SCD_RS_DRY_SIGN set: skipping card verify",
-        ));
-    }
-
     let pin_bytes = pin.expose_secret().clone();
     let signature = sign_digest_info(ident, &pin_bytes, digest_info).map_err(card_err)?;
     session.cache_pin(pin_bytes);

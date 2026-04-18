@@ -99,3 +99,88 @@ hold the stale handle and require `gpgconf --kill scdaemon`.
 
 Still needs a human pulling and reinserting the card during a running
 probe. Covered in the script via prompt, not yet executed.
+
+## Phase 3 — Assuan compatibility
+
+### `gpg-agent` pads the PIN with trailing NULLs
+
+gpg-agent allocates a 257-byte `gcry_malloc_secure` buffer for the PIN,
+writes the user input, NULL-terminates, and then sends the whole buffer
+on the Assuan wire. Our probe received 90 bytes for an 8-character PIN:
+the 8 ASCII bytes followed by 82 trailing NULLs. Passing that padded
+slice to `verify_pw1_sign` makes the card reject it as a 90-char PIN
+and burn a retry.
+
+Stock scdaemon handles this implicitly via C-string semantics — it
+receives the bytes into a `char*`, and subsequent `strlen` / `strcpy`
+calls truncate at the first NULL. We have to truncate explicitly.
+
+**How to apply:** `pinentry::request_pin` treats the INQUIRE NEEDPIN
+response as a C string — truncate at the first NULL byte before wrapping
+in `SecretBox`. This matches libgcrypt's convention and is what the card
+actually wants.
+
+### RSA keygrip format
+
+For RSA keys, libgcrypt feeds the modulus `n` through
+`gcry_sexp_build("(n %m)", mpi)` using the `GCRYMPI_FMT_STD` MPI
+serialization, which emits unsigned big-endian bytes with a leading
+`0x00` prepended whenever the magnitude's high bit is set. The keygrip
+is SHA-1 of that byte sequence, not of the stripped magnitude. We
+verified byte-for-byte against the three keygrips captured in Phase 0.
+
+Keygrip for EdDSA, ECDH, and ECDSA keys is deferred — not needed for
+the user's RSA-4096 card.
+
+### PIN cache design
+
+One cache per Assuan session, TTL matching gpg-agent's
+`default-cache-ttl` (600s). Mode-agnostic: OpenPGP cards verify PW1
+mode 81 (signing) and mode 82 (user/decrypt) against the same PIN
+bytes, so one cache entry serves both paths and a clearsign primes the
+PIN for a subsequent decrypt.
+
+`CommandHandler::reset_session` clears only the SETDATA buffer. Card
+identity, keygrip map, `CardInfo`, and the PIN all survive `RESTART`
+because `RESTART` is a per-flow boundary in gpg-agent's protocol, not a
+session termination.
+
+### Performance of the sign path
+
+With the CardInfo cache + SERIALNO short-circuit, a repeat
+`gpg --clearsign` breaks down as:
+
+| Phase                               | Time    | Source                         |
+|-------------------------------------|---------|--------------------------------|
+| PC/SC `EstablishContext` + enumerate| 40 ms   | `PcscBackend::card_backends`   |
+| `Card::new` (SELECT + read ARD)     | 500 ms  | `openpgp_card::Card::new`      |
+| `verify_pw1_sign`                   | 600 ms  | verify APDU + round-trip       |
+| `pso_compute_digital_signature`     | 1600 ms | Nitrokey 3 RSA-4096 silicon    |
+| Assuan round-trips / overhead       | ~50 ms  | gpg-agent <-> scd-rs           |
+| **Total**                           | **~2.8 s** |                            |
+
+1.6s of the total is the Nitrokey's own RSA math — not improvable in
+software. The remaining ~1.1s is the cost of our per-operation handle
+discipline. A future **short-TTL card-handle pool** (hold the card
+handle for N seconds after a successful op, reuse in that window) would
+let rapid back-to-back signs drop to ~1.6s each. Tradeoff: reintroduces
+a bounded stale-handle surface area for the TTL window. Worth
+benchmarking and choosing a conservative TTL (e.g. 2–5s) before shipping.
+
+### gpg-agent quirks that surfaced during cutover
+
+These were all found by enabling `--log-file` and observing the live
+command stream:
+
+- `OPTION event-signal=<n>` — sent immediately after connect; we accept
+  and ignore.
+- `GETATTR $ENCRKEYID` / `GETATTR $SIGNKEYID` / `GETATTR $AUTHKEYID` —
+  dollar-prefixed "private" attributes stock scdaemon emits as status
+  lines during LEARN. `gpg-agent` later queries them via GETATTR for
+  its own bookkeeping. We return NOT_SUPPORTED for these; gpg-agent
+  tolerates the ERR and continues.
+- `READKEY -- $<name>` — same family; gpg-agent pokes but doesn't fail
+  when it's unsupported.
+- gpg-agent sends `GETINFO version` and compares to its own version
+  string. Returning `"2.4.9 (scd-rs 0.1.0)"` passes the "older than us"
+  check while keeping the scd-rs tag visible in logs.
