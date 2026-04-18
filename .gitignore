@@ -13,6 +13,7 @@ Cargo.lock.bak
 .env
 .env.local
 *.log
+!docs/assuan-traces/*.log
 
 # Tool-local state
 .claude/
