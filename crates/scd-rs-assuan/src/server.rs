@@ -46,16 +46,25 @@ pub enum ServerError {
 
 /// Trait implemented by downstream crates to dispatch Assuan commands.
 ///
-/// The handler emits zero or more status/data lines via `conn.write_*` and
-/// returns `Ok(())` to have the server emit a final `OK`, or `Err` to have
-/// the server emit `ERR` on its behalf.
+/// Each connection owns an instance of `Self::Session` initialized via
+/// `Default`. The handler mutates that through `handle`. On `RESTART`, the
+/// server calls `reset_session` to clear per-flow state without closing the
+/// transport.
 pub trait CommandHandler: Send + Sync + 'static {
+    type Session: Default + Send + 'static;
+
     fn handle(
         &self,
+        session: &mut Self::Session,
         conn: &mut Connection,
         verb: &str,
         args: &str,
     ) -> impl Future<Output = Result<(), HandlerError>> + Send;
+
+    /// Reset per-session state, typically in response to `RESTART`.
+    fn reset_session(&self, session: &mut Self::Session) {
+        *session = Self::Session::default();
+    }
 }
 
 /// One live Assuan session. Handlers receive a mutable reference to this
@@ -180,6 +189,7 @@ async fn drive_session<H: CommandHandler>(
     handler: Arc<H>,
 ) -> Result<(), ServerError> {
     let mut conn = Connection::new(stream);
+    let mut session = H::Session::default();
 
     // Assuan servers send an initial OK on connect, per the spec.
     conn.write_ok(Some("scd-rs ready")).await?;
@@ -194,15 +204,19 @@ async fn drive_session<H: CommandHandler>(
                 conn.write_ok(Some("closing connection")).await?;
                 return Ok(());
             }
+            ClientLine::Command { verb, args: _ } if verb == "RESTART" => {
+                handler.reset_session(&mut session);
+                conn.write_ok(None).await?;
+            }
             ClientLine::Command { verb, args } => {
-                match handler.handle(&mut conn, &verb, &args).await {
+                match handler.handle(&mut session, &mut conn, &verb, &args).await {
                     Ok(()) => conn.write_ok(None).await?,
                     Err(e) => conn.write_err(&e).await?,
                 }
             }
             ClientLine::Data(_) | ClientLine::End | ClientLine::Cancel => {
                 // These only make sense inside an INQUIRE round-trip, which
-                // is Phase 3 scope. Ignore stray ones for now.
+                // is driven by the handler itself (see Connection::inquire).
                 tracing::debug!("ignoring out-of-sequence client line");
             }
         }

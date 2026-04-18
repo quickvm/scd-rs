@@ -13,8 +13,11 @@ use tokio::net::UnixStream;
 struct EchoHandler;
 
 impl CommandHandler for EchoHandler {
+    type Session = ();
+
     fn handle(
         &self,
+        _session: &mut (),
         conn: &mut Connection,
         verb: &str,
         args: &str,
