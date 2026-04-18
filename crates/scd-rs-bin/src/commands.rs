@@ -37,7 +37,7 @@ impl CommandHandler for ScdHandler {
         verb: &str,
         args: &str,
     ) -> Result<(), HandlerError> {
-        tracing::debug!(verb, args, "command");
+        tracing::info!(verb, args, "command");
         match verb {
             "GETINFO" => getinfo(conn, args).await,
             "SERIALNO" => serialno(session, conn, args).await,
@@ -58,18 +58,36 @@ impl CommandHandler for ScdHandler {
 async fn getinfo(conn: &mut Connection, args: &str) -> Result<(), HandlerError> {
     match args {
         "version" => {
-            conn.write_data(env!("CARGO_PKG_VERSION").as_bytes())
-                .await
-                .map_err(|e| handler_io(&e))?;
+            // Prefix with a GnuPG-looking version so gpg-agent's "outdated
+            // scdaemon" check passes, then tag our own.
+            conn.write_data(
+                format!(
+                    "{} (scd-rs {})",
+                    GPG_VERSION_COMPAT,
+                    env!("CARGO_PKG_VERSION"),
+                )
+                .as_bytes(),
+            )
+            .await
+            .map_err(|e| handler_io(&e))?;
             Ok(())
         }
-        "socket_name" => Err(HandlerError::new(err::NOT_SUPPORTED, "socket_name n/a")),
+        "socket_name" | "status" | "reader_list" | "deny_admin" | "app_list"
+        | "card_list" | "connections" => Err(HandlerError::new(
+            err::NOT_SUPPORTED,
+            format!("GETINFO {args} not supported"),
+        )),
         other => Err(HandlerError::new(
             err::NOT_SUPPORTED,
             format!("GETINFO {other} not supported"),
         )),
     }
 }
+
+/// `GnuPG` version we pretend to be for the purposes of the `GETINFO version`
+/// check. Bump this alongside the fedora-stable scdaemon release so we keep
+/// passing the "outdated server" guard.
+const GPG_VERSION_COMPAT: &str = "2.4.9";
 
 async fn serialno(
     session: &mut Session,
@@ -299,29 +317,95 @@ async fn getattr(
     args: &str,
 ) -> Result<(), HandlerError> {
     let ident = require_ident(session)?;
+    let info = read_card_info(&ident).map_err(card_err)?;
     match args {
         "KEY-ATTR" => {
-            let info = read_card_info(&ident).map_err(card_err)?;
             for (idx, key) in info.keys.iter().enumerate() {
                 let algo = key.algorithm.as_deref().map_or_else(
                     || "unknown".into(),
                     algo_to_scd_token,
                 );
                 // For RSA the scdaemon format is `<slot> 1 rsa<bits> <e_bits> 1`.
-                conn.write_status(
-                    "KEY-ATTR",
-                    &format!("{} 1 {algo} 32 1", idx + 1),
-                )
-                .await
-                .map_err(|e| handler_io(&e))?;
+                status(conn, "KEY-ATTR", &format!("{} 1 {algo} 32 1", idx + 1)).await?;
             }
-            Ok(())
         }
-        other => Err(HandlerError::new(
-            err::NOT_SUPPORTED,
-            format!("GETATTR {other} not supported"),
-        )),
+        "KEY-FPR" => {
+            for (idx, key) in info.keys.iter().enumerate() {
+                if let Some(fp) = &key.fingerprint {
+                    status(conn, "KEY-FPR", &format!("{} {fp}", idx + 1)).await?;
+                }
+            }
+        }
+        "KEY-TIME" => {
+            for (idx, key) in info.keys.iter().enumerate() {
+                if let Some(ts) = key.created {
+                    status(conn, "KEY-TIME", &format!("{} {ts}", idx + 1)).await?;
+                }
+            }
+        }
+        "SERIALNO" => {
+            status(conn, "SERIALNO", info.ident.as_ref()).await?;
+        }
+        "APPTYPE" => {
+            status(conn, "APPTYPE", "openpgp").await?;
+        }
+        "CHV-STATUS" => {
+            let c = &info.chv_status;
+            status(
+                conn,
+                "CHV-STATUS",
+                &format!(
+                    "+{}+{}+{}+{}+{}+{}+{}",
+                    u8::from(c.signing_pin_multi_op),
+                    c.pw1_max_len,
+                    c.rc_max_len,
+                    c.pw3_max_len,
+                    c.pw1_retries,
+                    c.rc_retries,
+                    c.pw3_retries,
+                ),
+            )
+            .await?;
+        }
+        "SIG-COUNTER" => {
+            status(conn, "SIG-COUNTER", &info.sig_counter.to_string()).await?;
+        }
+        "DISP-NAME" => {
+            if let Some(name) = &info.cardholder_name {
+                status(conn, "DISP-NAME", name).await?;
+            }
+        }
+        "DISP-LANG" => {
+            if let Some(lang) = &info.cardholder_lang {
+                status(conn, "DISP-LANG", lang).await?;
+            }
+        }
+        "PUBKEY-URL" => {
+            if let Some(url) = &info.pubkey_url {
+                status(conn, "PUBKEY-URL", url).await?;
+            }
+        }
+        "KEYPAIRINFO" => {
+            for key in &info.keys {
+                status(conn, "KEYPAIRINFO", &keypairinfo_payload(key)).await?;
+            }
+        }
+        "MANUFACTURER" => {
+            status(
+                conn,
+                "MANUFACTURER",
+                &format!("{} {}", info.manufacturer_id, info.manufacturer_name),
+            )
+            .await?;
+        }
+        other => {
+            return Err(HandlerError::new(
+                err::NOT_SUPPORTED,
+                format!("GETATTR {other} not supported"),
+            ))
+        }
     }
+    Ok(())
 }
 
 fn setdata(session: &mut Session, args: &str) -> Result<(), HandlerError> {
