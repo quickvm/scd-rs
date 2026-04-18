@@ -1,0 +1,30 @@
+[package]
+name = "scd-rs-bin"
+description = "scdaemon-compatible daemon and hardware probe binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "scd-rs"
+path = "src/bin/scd-rs.rs"
+
+[[bin]]
+name = "scd-rs-probe"
+path = "src/bin/scd-rs-probe.rs"
+
+[dependencies]
+scd-rs-card = { path = "../scd-rs-card" }
+scd-rs-assuan = { path = "../scd-rs-assuan" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

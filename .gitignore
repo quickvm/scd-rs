@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local state
+.env
+.env.local
+*.log
+
+# Tool-local state
+.claude/
+.codex
