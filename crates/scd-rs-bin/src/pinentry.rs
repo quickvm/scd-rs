@@ -11,12 +11,22 @@ use zeroize::Zeroize;
 ///
 /// Returns the PIN as raw bytes wrapped in `SecretBox`, which zeroises the
 /// buffer when dropped.
+///
+/// `gpg-agent` allocates a 257-byte secure buffer for the PIN, fills it with
+/// the user's input, NULL-terminates, then sends the whole buffer on the
+/// Assuan wire — so we receive the PIN followed by trailing NULL padding.
+/// Use C-string semantics to pull out just the meaningful prefix; otherwise
+/// the card sees a bogus over-length PIN and rejects it (burning a retry).
 pub async fn request_pin(
     conn: &mut Connection,
     prompt: &str,
 ) -> Result<SecretBox<Vec<u8>>, ServerError> {
     let mut bytes = conn.inquire("NEEDPIN", prompt).await?;
-    // Wrap before anything can panic / return early past this point.
+    let real_len = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(bytes.len());
+    bytes.truncate(real_len);
     let pin = SecretBox::new(Box::new(bytes.clone()));
     bytes.zeroize();
     Ok(pin)

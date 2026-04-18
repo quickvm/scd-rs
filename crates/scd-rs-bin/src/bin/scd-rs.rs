@@ -49,7 +49,11 @@ struct Cli {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_tracing(cli.log_file.as_deref(), cli.debug.is_some())?;
+    let log_file = cli
+        .log_file
+        .clone()
+        .or_else(|| std::env::var_os("SCD_RS_LOG").map(PathBuf::from));
+    init_tracing(log_file.as_deref(), cli.debug.is_some())?;
     let _ = (cli.server, cli.multi_server, cli.homedir, cli.daemon);
 
     if let Some(path) = cli.socket {

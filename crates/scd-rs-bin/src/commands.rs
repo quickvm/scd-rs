@@ -10,7 +10,7 @@ use scd_rs_card::{
 use secrecy::ExposeSecret;
 
 use crate::pinentry::{build_prompt, request_pin};
-use crate::state::{KnownKeys, Session};
+use crate::state::{KnownKeys, PinMode, Session};
 
 /// Assuan error codes mirrored from gpg-agent / scdaemon.
 ///
@@ -30,6 +30,17 @@ pub struct ScdHandler;
 impl CommandHandler for ScdHandler {
     type Session = Session;
 
+    /// gpg-agent issues RESTART between logical flows (card-status → sign →
+    /// decrypt, etc.) and expects per-flow state to clear. Clear SETDATA and
+    /// the keygrip cache, but preserve the PIN cache so subsequent sign/
+    /// decrypt operations don't re-prompt the user within the TTL window.
+    fn reset_session(&self, session: &mut Session) {
+        session.setdata.clear();
+        session.known_keys = KnownKeys::default();
+        session.current_ident = None;
+        // Intentionally keep cached_pin — that's the whole point of caching.
+    }
+
     async fn handle(
         &self,
         session: &mut Session,
@@ -40,6 +51,13 @@ impl CommandHandler for ScdHandler {
         tracing::info!(verb, args, "command");
         match verb {
             "GETINFO" => getinfo(conn, args).await,
+            "OPTION" => {
+                // gpg-agent sends `OPTION event-signal=NN` and similar
+                // per-connection settings. We accept and ignore; any
+                // option we actually need will surface via trace logs.
+                tracing::debug!(option = args, "OPTION (ignored)");
+                Ok(())
+            }
             "SERIALNO" => serialno(session, conn, args).await,
             "LEARN" => learn(session, conn, args).await,
             "KEYINFO" => keyinfo(session, conn, args).await,
@@ -448,15 +466,56 @@ async fn pksign(
     let info = read_card_info(&ident).map_err(card_err)?;
     let prompt = build_prompt(info.ident.as_ref(), info.cardholder_name.as_deref(), Some(info.sig_counter));
 
-    let pin = request_pin(conn, &prompt)
-        .await
-        .map_err(|e| handler_io(&e))?;
-    let signature =
-        sign_digest_info(&ident, pin.expose_secret(), &digest_info).map_err(card_err)?;
+    let signature = sign_with_cached_pin(session, conn, &ident, &digest_info, &prompt).await?;
     conn.write_data(&signature)
         .await
         .map_err(|e| handler_io(&e))?;
     Ok(())
+}
+
+/// Try to sign using the cached PIN; on bad-PIN, invalidate cache and
+/// re-prompt once. Keeps pinentry off the user's face for every single sign.
+async fn sign_with_cached_pin(
+    session: &mut Session,
+    conn: &mut Connection,
+    ident: &str,
+    digest_info: &[u8],
+    prompt: &str,
+) -> Result<Vec<u8>, HandlerError> {
+    if let Some(cached) = session.pin_for(PinMode::Signing) {
+        match sign_digest_info(ident, cached, digest_info) {
+            Ok(sig) => {
+                tracing::debug!("PKSIGN served from PIN cache");
+                return Ok(sig);
+            }
+            Err(scd_rs_card::CardError::BadPin { .. }) => {
+                tracing::info!("cached PIN rejected; prompting for fresh PIN");
+                session.clear_pin();
+                // Fall through to the fresh-prompt path below.
+            }
+            Err(other) => return Err(card_err(other)),
+        }
+    }
+
+    let pin = request_pin(conn, prompt)
+        .await
+        .map_err(|e| handler_io(&e))?;
+
+    if std::env::var_os("SCD_RS_DRY_SIGN").is_some_and(|v| !v.is_empty()) {
+        tracing::warn!(
+            pin_len_after_trim = pin.expose_secret().len(),
+            "DRY_SIGN: skipping card verify",
+        );
+        return Err(HandlerError::new(
+            err::GENERAL,
+            "SCD_RS_DRY_SIGN set: skipping card verify",
+        ));
+    }
+
+    let pin_bytes = pin.expose_secret().clone();
+    let signature = sign_digest_info(ident, &pin_bytes, digest_info).map_err(card_err)?;
+    session.cache_pin(pin_bytes, PinMode::Signing);
+    Ok(signature)
 }
 
 async fn pkdecrypt(
@@ -480,17 +539,43 @@ async fn pkdecrypt(
     let info = read_card_info(&ident).map_err(card_err)?;
     let prompt = build_prompt(info.ident.as_ref(), info.cardholder_name.as_deref(), None);
 
-    let pin = request_pin(conn, &prompt)
-        .await
-        .map_err(|e| handler_io(&e))?;
-    let plaintext =
-        decrypt(&ident, pin.expose_secret(), &ciphertext).map_err(card_err)?;
+    let plaintext = decrypt_with_cached_pin(session, conn, &ident, &ciphertext, &prompt).await?;
     // gpg-agent expects the PADDING status line before the plaintext.
     status(conn, "PADDING", "0").await?;
     conn.write_data(&plaintext)
         .await
         .map_err(|e| handler_io(&e))?;
     Ok(())
+}
+
+async fn decrypt_with_cached_pin(
+    session: &mut Session,
+    conn: &mut Connection,
+    ident: &str,
+    ciphertext: &[u8],
+    prompt: &str,
+) -> Result<Vec<u8>, HandlerError> {
+    if let Some(cached) = session.pin_for(PinMode::User) {
+        match decrypt(ident, cached, ciphertext) {
+            Ok(plain) => {
+                tracing::debug!("PKDECRYPT served from PIN cache");
+                return Ok(plain);
+            }
+            Err(scd_rs_card::CardError::BadPin { .. }) => {
+                tracing::info!("cached PIN rejected; prompting for fresh PIN");
+                session.clear_pin();
+            }
+            Err(other) => return Err(card_err(other)),
+        }
+    }
+
+    let pin = request_pin(conn, prompt)
+        .await
+        .map_err(|e| handler_io(&e))?;
+    let pin_bytes = pin.expose_secret().clone();
+    let plaintext = decrypt(ident, &pin_bytes, ciphertext).map_err(card_err)?;
+    session.cache_pin(pin_bytes, PinMode::User);
+    Ok(plaintext)
 }
 
 fn resolve_key(session: &mut Session, keygrip: &str) -> Result<KeyUsage, HandlerError> {

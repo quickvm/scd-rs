@@ -170,13 +170,29 @@ impl Connection {
                 .await?;
         }
         let mut payload = Vec::new();
+        let mut data_lines = 0u32;
         loop {
             let Some(line) = self.read_line().await? else {
                 return Err(ServerError::InquireEof);
             };
             match line {
-                ClientLine::Data(bytes) => payload.extend(bytes),
-                ClientLine::End => return Ok(payload),
+                ClientLine::Data(bytes) => {
+                    data_lines += 1;
+                    tracing::info!(
+                        data_line = data_lines,
+                        len = bytes.len(),
+                        "inquire: received D line",
+                    );
+                    payload.extend(bytes);
+                }
+                ClientLine::End => {
+                    tracing::info!(
+                        total_lines = data_lines,
+                        total_bytes = payload.len(),
+                        "inquire: END received",
+                    );
+                    return Ok(payload);
+                }
                 ClientLine::Cancel => return Err(ServerError::InquireCancelled),
                 other => return Err(ServerError::InquireUnexpected(other)),
             }
@@ -274,7 +290,10 @@ async fn drive_session<H: CommandHandler>(
             ClientLine::Command { verb, args } => {
                 match handler.handle(&mut session, &mut conn, &verb, &args).await {
                     Ok(()) => conn.write_ok(None).await?,
-                    Err(e) => conn.write_err(&e).await?,
+                    Err(e) => {
+                        tracing::warn!(code = e.code, message = %e.message, "handler returned ERR");
+                        conn.write_err(&e).await?;
+                    }
                 }
             }
             ClientLine::Data(_) | ClientLine::End | ClientLine::Cancel => {

@@ -403,11 +403,19 @@ fn manufacturer_name(id: u16) -> String {
 /// the wrapper's `Signer` insists on rebuilding a `DigestInfo` from a raw
 /// hash — we already have the exact bytes `gpg-agent` wants the card to
 /// sign.
-#[instrument(level = "debug", skip(pin, digest_info), fields(ident))]
+#[instrument(level = "debug", skip(pin, digest_info), fields(ident, pin_len = pin.len(), di_len = digest_info.len()))]
 pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<Vec<u8>> {
     with_low_level_card(ident, |txn| {
-        txn.verify_pw1_sign(pin)?;
-        let sig = txn.pso_compute_digital_signature(digest_info.to_vec())?;
+        txn.verify_pw1_sign(pin).map_err(|e| {
+            tracing::error!(error = %e, "verify_pw1_sign failed");
+            e
+        })?;
+        debug!("PIN verified; sending PSO:CDS");
+        let sig = txn.pso_compute_digital_signature(digest_info.to_vec()).map_err(|e| {
+            tracing::error!(error = %e, "pso_compute_digital_signature failed");
+            e
+        })?;
+        debug!(sig_len = sig.len(), "signature returned");
         Ok(sig)
     })
 }
@@ -417,11 +425,19 @@ pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<V
 /// `ciphertext` is the payload `gpg-agent` placed in `SETDATA` (for RSA:
 /// the raw padded block, optionally preceded by a 1-byte algo hint that
 /// scdaemon forwards verbatim). The card returns the unpadded plaintext.
-#[instrument(level = "debug", skip(pin, ciphertext), fields(ident))]
+#[instrument(level = "debug", skip(pin, ciphertext), fields(ident, pin_len = pin.len(), ct_len = ciphertext.len()))]
 pub fn decrypt(ident: &str, pin: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     with_low_level_card(ident, |txn| {
-        txn.verify_pw1_user(pin)?;
-        let plain = txn.pso_decipher(ciphertext.to_vec())?;
+        txn.verify_pw1_user(pin).map_err(|e| {
+            tracing::error!(error = %e, "verify_pw1_user failed");
+            e
+        })?;
+        debug!("PIN verified; sending PSO:DECIPHER");
+        let plain = txn.pso_decipher(ciphertext.to_vec()).map_err(|e| {
+            tracing::error!(error = %e, "pso_decipher failed");
+            e
+        })?;
+        debug!(plain_len = plain.len(), "plaintext returned");
         Ok(plain)
     })
 }

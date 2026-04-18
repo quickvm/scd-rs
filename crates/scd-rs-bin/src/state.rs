@@ -4,8 +4,10 @@
 //! any PC/SC handles — card access is always fresh via `scd_rs_card`.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use scd_rs_card::{CardIdent, CardInfo, KeyUsage};
+use secrecy::{ExposeSecret, SecretBox};
 
 /// Snapshot of the keys learned from a `LEARN --force` / `read_card_info`.
 #[derive(Debug, Clone, Default)]
@@ -46,6 +48,58 @@ impl KnownKeys {
     }
 }
 
+/// Which PW1 mode a cached PIN was validated against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMode {
+    /// PW1 mode 81 (signing).
+    Signing,
+    /// PW1 mode 82 (decryption / authentication).
+    User,
+}
+
+/// A PIN cached in-memory for the lifetime of the session or until the TTL
+/// expires. Mirrors what stock `scdaemon` keeps via gpg-agent's pin cache so
+/// users don't re-enter the PIN on every sign within a gpg-agent session.
+pub struct CachedPin {
+    bytes: SecretBox<Vec<u8>>,
+    mode: PinMode,
+    expires_at: Instant,
+}
+
+impl std::fmt::Debug for CachedPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedPin")
+            .field("mode", &self.mode)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedPin {
+    #[must_use]
+    pub fn new(bytes: Vec<u8>, mode: PinMode, ttl: Duration) -> Self {
+        Self {
+            bytes: SecretBox::new(Box::new(bytes)),
+            mode,
+            expires_at: Instant::now() + ttl,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(&self, mode: PinMode) -> bool {
+        self.mode == mode && Instant::now() < self.expires_at
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.expose_secret()
+    }
+}
+
+/// Default TTL for the in-process PIN cache, chosen to match gpg-agent's
+/// `default-cache-ttl` of 600 seconds.
+pub const DEFAULT_PIN_TTL: Duration = Duration::from_secs(600);
+
 /// One Assuan session's worth of state.
 #[derive(Debug, Default)]
 pub struct Session {
@@ -57,6 +111,28 @@ pub struct Session {
     pub setdata: Vec<u8>,
     /// Keys discovered by the last `LEARN` / `KEYINFO --list`.
     pub known_keys: KnownKeys,
+    /// In-memory PIN cache. Cleared on RESTART and on bad-PIN errors.
+    pub cached_pin: Option<CachedPin>,
+}
+
+impl Session {
+    /// Return the cached PIN bytes if it's still valid for `mode`.
+    #[must_use]
+    pub fn pin_for(&self, mode: PinMode) -> Option<&[u8]> {
+        self.cached_pin
+            .as_ref()
+            .filter(|p| p.is_valid(mode))
+            .map(CachedPin::bytes)
+    }
+
+    /// Store a PIN in the cache with the default TTL.
+    pub fn cache_pin(&mut self, bytes: Vec<u8>, mode: PinMode) {
+        self.cached_pin = Some(CachedPin::new(bytes, mode, DEFAULT_PIN_TTL));
+    }
+
+    pub fn clear_pin(&mut self) {
+        self.cached_pin = None;
+    }
 }
 
 impl Session {
