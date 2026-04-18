@@ -413,7 +413,7 @@ pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<V
             e
         })?;
         tracing::debug!(
-            verify_ms = t_verify.elapsed().as_millis() as u64,
+            verify_ms = t_verify.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             "PIN verified; sending PSO:CDS"
         );
         let t_cds = std::time::Instant::now();
@@ -422,13 +422,13 @@ pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<V
             e
         })?;
         tracing::debug!(
-            cds_ms = t_cds.elapsed().as_millis() as u64,
+            cds_ms = t_cds.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             sig_len = sig.len(),
             "signature returned"
         );
         Ok(sig)
     });
-    tracing::info!(total_ms = t_overall.elapsed().as_millis() as u64, "sign_digest_info finished");
+    tracing::info!(total_ms = t_overall.elapsed().as_millis().try_into().unwrap_or(u64::MAX), "sign_digest_info finished");
     result
 }
 
@@ -464,7 +464,7 @@ where
         message: e.to_string(),
         retryable: true,
     })?;
-    let mut enum_ms: u64 = t_ctx.elapsed().as_millis() as u64;
+    let mut enum_ms: u64 = t_ctx.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     for backend in backends {
         let backend: Box<dyn CardBackend + Send + Sync> = backend.map_err(|e| CardError::Pcsc {
             message: e.to_string(),
@@ -472,7 +472,7 @@ where
         })?;
         let t_open = std::time::Instant::now();
         let mut card = OcCard::new(backend)?;
-        let open_ms = t_open.elapsed().as_millis() as u64;
+        let open_ms = t_open.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let mut txn = card.transaction()?;
         let app_id = txn.application_identifier()?;
         if app_id.ident().eq_ignore_ascii_case(&short) {

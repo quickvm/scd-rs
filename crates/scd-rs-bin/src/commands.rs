@@ -10,7 +10,7 @@ use scd_rs_card::{
 use secrecy::ExposeSecret;
 
 use crate::pinentry::{build_prompt, request_pin};
-use crate::state::{KnownKeys, PinMode, Session};
+use crate::state::{KnownKeys, Session};
 
 /// Assuan error codes mirrored from gpg-agent / scdaemon.
 ///
@@ -522,7 +522,7 @@ async fn sign_with_cached_pin(
     digest_info: &[u8],
     prompt: &str,
 ) -> Result<Vec<u8>, HandlerError> {
-    if let Some(cached) = session.pin_for(PinMode::Signing) {
+    if let Some(cached) = session.cached_pin_bytes() {
         match sign_digest_info(ident, cached, digest_info) {
             Ok(sig) => {
                 tracing::debug!("PKSIGN served from PIN cache");
@@ -531,7 +531,6 @@ async fn sign_with_cached_pin(
             Err(scd_rs_card::CardError::BadPin { .. }) => {
                 tracing::info!("cached PIN rejected; prompting for fresh PIN");
                 session.clear_pin();
-                // Fall through to the fresh-prompt path below.
             }
             Err(other) => return Err(card_err(other)),
         }
@@ -554,7 +553,7 @@ async fn sign_with_cached_pin(
 
     let pin_bytes = pin.expose_secret().clone();
     let signature = sign_digest_info(ident, &pin_bytes, digest_info).map_err(card_err)?;
-    session.cache_pin(pin_bytes, PinMode::Signing);
+    session.cache_pin(pin_bytes);
     Ok(signature)
 }
 
@@ -593,7 +592,7 @@ async fn decrypt_with_cached_pin(
     ciphertext: &[u8],
     prompt: &str,
 ) -> Result<Vec<u8>, HandlerError> {
-    if let Some(cached) = session.pin_for(PinMode::User) {
+    if let Some(cached) = session.cached_pin_bytes() {
         match decrypt(ident, cached, ciphertext) {
             Ok(plain) => {
                 tracing::debug!("PKDECRYPT served from PIN cache");
@@ -612,7 +611,7 @@ async fn decrypt_with_cached_pin(
         .map_err(|e| handler_io(&e))?;
     let pin_bytes = pin.expose_secret().clone();
     let plaintext = decrypt(ident, &pin_bytes, ciphertext).map_err(card_err)?;
-    session.cache_pin(pin_bytes, PinMode::User);
+    session.cache_pin(pin_bytes);
     Ok(plaintext)
 }
 

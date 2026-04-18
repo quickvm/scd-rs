@@ -48,7 +48,11 @@ impl KnownKeys {
     }
 }
 
-/// Which PW1 mode a cached PIN was validated against.
+/// Which PW1 mode a card operation needs; the daemon uses this only to
+/// dispatch the right verify APDU (`verify_pw1_sign` vs `verify_pw1_user`).
+/// On standard `OpenPGP` cards both modes accept the same PIN bytes, so our
+/// in-memory cache is mode-agnostic and can serve signing and user ops with
+/// the same entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinMode {
     /// PW1 mode 81 (signing).
@@ -58,18 +62,16 @@ pub enum PinMode {
 }
 
 /// A PIN cached in-memory for the lifetime of the session or until the TTL
-/// expires. Mirrors what stock `scdaemon` keeps via gpg-agent's pin cache so
-/// users don't re-enter the PIN on every sign within a gpg-agent session.
+/// expires. Matches gpg-agent's default-cache-ttl so repeat signs and
+/// decrypts within a session don't re-prompt the user.
 pub struct CachedPin {
     bytes: SecretBox<Vec<u8>>,
-    mode: PinMode,
     expires_at: Instant,
 }
 
 impl std::fmt::Debug for CachedPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedPin")
-            .field("mode", &self.mode)
             .field("expires_at", &self.expires_at)
             .finish_non_exhaustive()
     }
@@ -77,17 +79,16 @@ impl std::fmt::Debug for CachedPin {
 
 impl CachedPin {
     #[must_use]
-    pub fn new(bytes: Vec<u8>, mode: PinMode, ttl: Duration) -> Self {
+    pub fn new(bytes: Vec<u8>, ttl: Duration) -> Self {
         Self {
             bytes: SecretBox::new(Box::new(bytes)),
-            mode,
             expires_at: Instant::now() + ttl,
         }
     }
 
     #[must_use]
-    pub fn is_valid(&self, mode: PinMode) -> bool {
-        self.mode == mode && Instant::now() < self.expires_at
+    pub fn is_valid(&self) -> bool {
+        Instant::now() < self.expires_at
     }
 
     #[must_use]
@@ -121,18 +122,18 @@ pub struct Session {
 }
 
 impl Session {
-    /// Return the cached PIN bytes if it's still valid for `mode`.
+    /// Return the cached PIN bytes if the cache is populated and unexpired.
     #[must_use]
-    pub fn pin_for(&self, mode: PinMode) -> Option<&[u8]> {
+    pub fn cached_pin_bytes(&self) -> Option<&[u8]> {
         self.cached_pin
             .as_ref()
-            .filter(|p| p.is_valid(mode))
+            .filter(|p| p.is_valid())
             .map(CachedPin::bytes)
     }
 
     /// Store a PIN in the cache with the default TTL.
-    pub fn cache_pin(&mut self, bytes: Vec<u8>, mode: PinMode) {
-        self.cached_pin = Some(CachedPin::new(bytes, mode, DEFAULT_PIN_TTL));
+    pub fn cache_pin(&mut self, bytes: Vec<u8>) {
+        self.cached_pin = Some(CachedPin::new(bytes, DEFAULT_PIN_TTL));
     }
 
     pub fn clear_pin(&mut self) {
