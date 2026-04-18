@@ -27,6 +27,7 @@ anyhow = "1.0"
 zeroize = { version = "1.8", features = ["derive"] }
 secrecy = "0.10"
 clap = { version = "4.6", features = ["derive"] }
+hex = "0.4"
 proptest = "1.11"
 
 [workspace.lints.rust]

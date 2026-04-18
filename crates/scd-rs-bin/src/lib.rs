@@ -6,3 +6,6 @@
 pub mod commands;
 pub mod pinentry;
 pub mod state;
+
+pub use commands::ScdHandler;
+pub use state::Session;

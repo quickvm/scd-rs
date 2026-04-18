@@ -19,6 +19,8 @@ path = "src/bin/scd-rs-probe.rs"
 [dependencies]
 scd-rs-card = { path = "../scd-rs-card" }
 scd-rs-assuan = { path = "../scd-rs-assuan" }
+anyhow = { workspace = true }
+hex = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
