@@ -239,6 +239,12 @@ pub struct PooledCard {
     pw1_sign_fresh: bool,
     /// PW1 mode 82 currently verified on this handle?
     pw1_user_fresh: bool,
+    /// `pw_status_bytes().pw1_cds_valid_once()` from the first transaction.
+    /// `true` means every `PSO:CDS` needs its own PW1/81 verify (`YubiKey`
+    /// default); `false` means one verify covers many signs (`Nitrokey`
+    /// default). PW1 mode 82 is always multi-op per the `OpenPGP` card
+    /// spec — no equivalent flag.
+    signing_pin_valid_once: bool,
 }
 
 // `card: Card<Open>` is deliberately omitted — it carries a backend
@@ -251,6 +257,7 @@ impl std::fmt::Debug for PooledCard {
             .field("last_used", &self.last_used)
             .field("pw1_sign_fresh", &self.pw1_sign_fresh)
             .field("pw1_user_fresh", &self.pw1_user_fresh)
+            .field("signing_pin_valid_once", &self.signing_pin_valid_once)
             .finish()
     }
 }
@@ -271,8 +278,12 @@ impl PooledCard {
 /// fresh and matching the requested `ident`. Otherwise opens a fresh
 /// PC/SC handle; on success and when `ttl > 0`, stores it in `pool`.
 ///
-/// When `pin` is Some, performs the corresponding PW1 verify before
-/// calling `f`. (Skip-verify on already-fresh handles is a follow-up.)
+/// When `pin` is Some, performs the corresponding PW1 verify *unless*
+/// the pooled handle already has that mode freshly verified and the
+/// card's PW1 mode permits multi-op use — then the verify is skipped.
+/// If the skipped-verify op fails, we retry once on the same handle
+/// with an explicit verify (handles the case where the card state drifted
+/// under us). Persistent failure bubbles up as usual.
 ///
 /// Failures on a pool hit invalidate the pool entry. Retryable errors
 /// (PC/SC communication, card reset, etc.) trigger one retry via the
@@ -295,7 +306,34 @@ where
         )
     {
         let mut pc = pool.take().expect("matched above");
-        let result = run_on_handle(&mut pc.card, pin, &mut f);
+        let can_skip_verify = match pin {
+            Some((PinMode::Signing, _)) => pc.pw1_sign_fresh && !pc.signing_pin_valid_once,
+            // PW1 mode 82 is multi-op by spec — no valid-once bit.
+            Some((PinMode::User, _)) => pc.pw1_user_fresh,
+            None => true,
+        };
+        let first = if can_skip_verify {
+            run_on_handle(&mut pc.card, None, &mut f)
+        } else {
+            run_on_handle(&mut pc.card, pin, &mut f)
+        };
+        let result = match first {
+            Ok(v) => Ok(v),
+            Err(err) if can_skip_verify && !err.is_retryable() => {
+                // Card probably lost its verified state (PC/SC-shared tenant
+                // came in, card was briefly reset, etc.). Clear the freshness
+                // flag and retry with a real verify on the same handle.
+                tracing::info!(error = %err, "skip-verify op failed; retrying with explicit verify");
+                if let Some((mode, _)) = pin {
+                    match mode {
+                        PinMode::Signing => pc.pw1_sign_fresh = false,
+                        PinMode::User => pc.pw1_user_fresh = false,
+                    }
+                }
+                run_on_handle(&mut pc.card, pin, &mut f)
+            }
+            Err(err) => Err(err),
+        };
         match result {
             Ok(value) => {
                 pc.last_used = Instant::now();
@@ -306,7 +344,7 @@ where
                     }
                 }
                 *pool = Some(pc);
-                debug!("pool hit");
+                debug!(skipped_verify = can_skip_verify && pin.is_some(), "pool hit");
                 return Ok(value);
             }
             Err(err) if err.is_retryable() => {
@@ -326,8 +364,7 @@ where
 
     // Fresh path
     let mut card = open_card_by_ident(ident)?;
-    let result = run_on_handle(&mut card, pin, &mut f);
-    let value = result?;
+    let (value, signing_pin_valid_once) = run_on_handle_and_meta(&mut card, pin, &mut f)?;
     if ttl > Duration::ZERO {
         let (sign_fresh, user_fresh) = match pin {
             Some((PinMode::Signing, _)) => (true, false),
@@ -340,6 +377,7 @@ where
             last_used: Instant::now(),
             pw1_sign_fresh: sign_fresh,
             pw1_user_fresh: user_fresh,
+            signing_pin_valid_once,
         });
     }
     Ok(value)
@@ -364,6 +402,34 @@ where
         }
     }
     f(&mut txn)
+}
+
+/// Same as [`run_on_handle`] but also reads and returns the card's
+/// `pw1_cds_valid_once` flag. Used on the fresh-open path so the pool
+/// entry knows whether skip-verify is legal for subsequent signing ops.
+/// Defaults to `true` (conservative: always re-verify) if the read fails.
+fn run_on_handle_and_meta<R, F>(
+    card: &mut Card<Open>,
+    pin: Option<(PinMode, &[u8])>,
+    f: &mut F,
+) -> Result<(R, bool)>
+where
+    F: FnMut(&mut Card<Transaction<'_>>) -> Result<R>,
+{
+    let mut txn = card.transaction()?;
+    if let Some((mode, pin_bytes)) = pin {
+        let pin_box = SecretBox::new(Box::from(pin_bytes));
+        match mode {
+            PinMode::Signing => txn.card().verify_pw1_sign(pin_box)?,
+            PinMode::User => txn.card().verify_pw1_user(pin_box)?,
+        }
+    }
+    let value = f(&mut txn)?;
+    let valid_once = txn
+        .pw_status_bytes()
+        .map(|p| p.pw1_cds_valid_once())
+        .unwrap_or(true);
+    Ok((value, valid_once))
 }
 
 /// Open a `Card<Open>` matching `ident`. Iterates PC/SC backends; returns
