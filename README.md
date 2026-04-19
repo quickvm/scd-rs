@@ -36,7 +36,7 @@ our pain, and we're open-sourcing it in the hope that it spares other Nitrokey
 (and maybe Yubikey, untested!) users from yet more RSI typing their PIN every 
 time they want to sign a git commit.
 
-That said, Use this at _your_ own risk.
+That said, use this at _your_ own risk.
 
 All three canonical workflows (`gpg --card-status`, `gpg --clearsign`,
 `gpg --decrypt`) are validated against stock scdaemon via a formal Assuan-wire
@@ -182,8 +182,7 @@ sign and just save the re-open overhead.
 The remaining 2.0 s is upstream-gated: ~0.5 s is `Card<Transaction>::new`
 re-reading ARD (an upstream `// FIXME: caching` in
 `openpgp-card::ocard::keys::public_key`), and ~1.6 s is the card silicon
-doing the actual RSA-4096 modular exponentiation. See `notes/` for the
-upstream fix path.
+doing the actual RSA-4096 modular exponentiation.
 
 ## Architecture
 
