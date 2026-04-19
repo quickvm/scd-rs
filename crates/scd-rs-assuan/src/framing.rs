@@ -48,7 +48,7 @@ pub fn encode_data(bytes: &[u8]) -> Vec<u8> {
 
 /// Encode `bytes` into one or more `D <payload>` lines, each ≤ `MAX_LINE_LEN`
 /// bytes when emitted with a trailing newline. The returned `Vec<u8>`s do
-/// **not** include the trailing newline — the caller adds it.
+/// **not** include the trailing newline; the caller adds it.
 #[must_use]
 pub fn encode_data_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
     // Budget leaves room for the `D ` prefix (2) and `\n` terminator (1).
@@ -182,7 +182,7 @@ mod tests {
         for line in &lines {
             assert!(line.len() < MAX_LINE_LEN);
         }
-        // Concatenate payloads and decode — must roundtrip.
+        // Concatenate payloads and decode; must roundtrip.
         let mut joined = Vec::new();
         for line in &lines {
             joined.extend_from_slice(&line[2..]);

@@ -17,7 +17,10 @@ use scd_rs_assuan::{serve_stdio_with_trace, AssuanServer, TraceSink};
 #[command(
     name = "scd-rs",
     version,
-    about = "scdaemon-compatible OpenPGP card daemon for gpg-agent"
+    author = "QuickVM, LLC <hello@quickvm.com>",
+    about = "scdaemon-compatible OpenPGP card daemon for gpg-agent",
+    after_help = "Copyright (c) 2025-2026 QuickVM, LLC. Licensed under the MIT License.\n\
+                  Source: https://github.com/quickvm/scd-rs"
 )]
 struct Cli {
     /// gpg-agent compat. Alias for stdio server mode (the default).
@@ -46,12 +49,11 @@ struct Cli {
     log_file: Option<PathBuf>,
 
     /// Tee every Assuan wire line to this file with `<- ` / `-> ` direction
-    /// markers. Intended for trace-diffing against stock scdaemon's
-    /// `debug ipc` output — see scripts/capture-scdrs-traces.sh.
+    /// markers.
     #[arg(long)]
     trace_file: Option<PathBuf>,
 
-    /// Accepted for compat — scdaemon uses this for its debug subsystem
+    /// Accepted for compat; scdaemon uses this for its debug subsystem
     /// masks. We treat the flag as enabling debug-level tracing.
     #[arg(long)]
     debug: Option<String>,

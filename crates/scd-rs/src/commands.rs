@@ -14,14 +14,14 @@ use crate::pool_ttl;
 use crate::state::{KnownKeys, Session};
 
 /// Assuan error codes mirrored from gpg-agent / scdaemon. Values are
-/// `(GPG_ERR_SOURCE_SCD << 24) | <gpg-error code>` — the canonical
+/// `(GPG_ERR_SOURCE_SCD << 24) | <gpg-error code>`; the canonical
 /// libgpg-error numbering you can cross-check with `gpg-error --list`.
 mod err {
     /// `GPG_ERR_GENERAL` (1). Catch-all for "something went wrong and we
     /// don't have a better classification".
     pub const GENERAL: u32 = 100_663_297;
     /// `GPG_ERR_NO_SECKEY` (17). The requested keygrip isn't on the card
-    /// at all — distinct from `INV_ID`, which covers "on the card, wrong
+    /// at all; distinct from `INV_ID`, which covers "on the card, wrong
     /// usage".
     pub const NO_SECRET_KEY: u32 = 100_663_313;
     /// `GPG_ERR_INV_ARG` (45). Malformed command arguments (missing
@@ -181,7 +181,7 @@ async fn learn(
 /// Subsequent callers within the same session reuse the cached snapshot,
 /// which cuts several seconds off sign and decrypt flows.
 ///
-/// Auto-enumerates the card if no `current_ident` is set — stock scdaemon
+/// Auto-enumerates the card if no `current_ident` is set; stock scdaemon
 /// caches card state across sessions and so can serve `KEYINFO --list`
 /// and other metadata queries before an explicit `SERIALNO`. scd-rs starts
 /// each session empty, so we fold in the enumeration step here rather
@@ -196,7 +196,7 @@ fn ensure_card_info(session: &mut Session) -> Result<&CardInfo, HandlerError> {
         session.current_ident = Some(chosen.0);
     }
     if session.cached_info.is_none() {
-        tracing::info!("CardInfo cache miss — refreshing from card");
+        tracing::info!("CardInfo cache miss; refreshing from card");
         let _ = refresh_card_info(session)?;
     } else {
         tracing::info!("CardInfo cache hit");

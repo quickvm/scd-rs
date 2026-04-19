@@ -13,7 +13,7 @@ use sha1::{Digest, Sha1};
 /// unsigned big-endian bytes (no leading zero padding).
 ///
 /// libgcrypt's `gcry_sexp_build("(n %m)", mpi)` emits the MPI in
-/// `GCRYMPI_FMT_STD` — the signed two's-complement form that prepends a
+/// `GCRYMPI_FMT_STD`; the signed two's-complement form that prepends a
 /// leading `0x00` byte whenever the high bit of the magnitude is set, so
 /// the value is unambiguously unsigned. The keygrip SHA-1 is computed over
 /// that serialization, not over the stripped magnitude alone.

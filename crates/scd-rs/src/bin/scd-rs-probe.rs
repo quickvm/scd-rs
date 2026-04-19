@@ -17,7 +17,10 @@ use tracing::{error, info, warn};
 #[command(
     name = "scd-rs-probe",
     version,
-    about = "Exercise scd-rs-card against real hardware"
+    author = "QuickVM, LLC <hello@quickvm.com>",
+    about = "Exercise scd-rs-card against real hardware",
+    after_help = "Copyright (c) 2025-2026 QuickVM, LLC. Licensed under the MIT License.\n\
+                  Source: https://github.com/quickvm/scd-rs"
 )]
 struct Cli {
     #[command(subcommand)]

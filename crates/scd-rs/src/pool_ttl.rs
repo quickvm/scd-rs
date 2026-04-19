@@ -1,6 +1,6 @@
 //! Resolves the card-handle pool TTL from `SCD_RS_CARD_POOL_TTL`.
 //!
-//! Syntax mirrors [`crate::pin_ttl`] — `<n><unit>`, unit = `s`/`m`/`h`/`d`.
+//! Syntax mirrors [`crate::pin_ttl`]; `<n><unit>`, unit = `s`/`m`/`h`/`d`.
 //! A bare `0` (the default) disables pooling, meaning every card operation
 //! opens a fresh PC/SC handle (the original Phase-1 discipline). Enable
 //! with e.g. `SCD_RS_CARD_POOL_TTL=5` for a 5 s window.

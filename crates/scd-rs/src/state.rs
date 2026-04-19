@@ -1,7 +1,7 @@
 //! Per-connection daemon session state.
 //!
 //! Lives for the lifetime of one Assuan client connection. Does not retain
-//! any PC/SC handles — card access is always fresh via `scd_rs_card`.
+//! any PC/SC handles; card access is always fresh via `scd_rs_card`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -64,7 +64,7 @@ pub enum PinMode {
 }
 
 /// A PIN cached in-memory for the lifetime of the session or until the TTL
-/// expires. TTL is a sliding window — each successful cache hit pushes
+/// expires. TTL is a sliding window; each successful cache hit pushes
 /// `expires_at` forward by another full TTL, so an all-day session keeps
 /// the PIN valid as long as card operations keep happening.
 ///

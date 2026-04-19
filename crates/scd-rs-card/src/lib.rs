@@ -53,11 +53,11 @@ impl AsRef<str> for CardIdent {
 /// Which of the three `OpenPGP` card subkeys a `KeyInfo` refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyUsage {
-    /// `OPENPGP.1` — signing + certification.
+    /// `OPENPGP.1`; signing + certification.
     Signing,
-    /// `OPENPGP.2` — decryption.
+    /// `OPENPGP.2`; decryption.
     Decryption,
-    /// `OPENPGP.3` — authentication.
+    /// `OPENPGP.3`; authentication.
     Authentication,
 }
 
@@ -100,7 +100,7 @@ impl KeyUsage {
 
 /// Metadata for one of the three `OpenPGP` subkeys on the card.
 ///
-/// `keygrip` is not populated in Phase 1 — see `docs/design-notes.md`.
+/// `keygrip` is not populated in Phase 1; see `docs/design-notes.md`.
 #[derive(Debug, Clone)]
 pub struct KeyInfo {
     pub usage: KeyUsage,
@@ -126,7 +126,7 @@ pub struct ChvStatus {
     pub pw3_retries: u8,
 }
 
-/// Full card snapshot — everything needed to answer `LEARN --force`.
+/// Full card snapshot; everything needed to answer `LEARN --force`.
 #[derive(Debug, Clone)]
 pub struct CardInfo {
     pub ident: CardIdent,
@@ -215,16 +215,16 @@ pub type Result<T> = std::result::Result<T, CardError>;
 /// PIN verification mode for a pooled card operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinMode {
-    /// PW1 mode 81 — signing (PSO:CDS).
+    /// PW1 mode 81; signing (PSO:CDS).
     Signing,
-    /// PW1 mode 82 — decryption / authentication.
+    /// PW1 mode 82; decryption / authentication.
     User,
 }
 
 /// A card handle kept open across operations so back-to-back signs/decrypts
 /// skip the ~500 ms `Card::<Open>::new` (SELECT + ARD) overhead.
 ///
-/// Holds `Card<Open>` — the PC/SC connection — but NOT `Card<Transaction>`.
+/// Holds `Card<Open>`; the PC/SC connection; but NOT `Card<Transaction>`.
 /// Each operation starts a fresh PC/SC transaction so other clients on a
 /// shared reader can interleave (the `pcsc-shared` guarantee still holds).
 /// What gets reused is the card session the connection owns, which means
@@ -243,11 +243,11 @@ pub struct PooledCard {
     /// `true` means every `PSO:CDS` needs its own PW1/81 verify (`YubiKey`
     /// default); `false` means one verify covers many signs (`Nitrokey`
     /// default). PW1 mode 82 is always multi-op per the `OpenPGP` card
-    /// spec — no equivalent flag.
+    /// spec; no equivalent flag.
     signing_pin_valid_once: bool,
 }
 
-// `card: Card<Open>` is deliberately omitted — it carries a backend
+// `card: Card<Open>` is deliberately omitted; it carries a backend
 // trait-object that isn't Debug.
 #[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for PooledCard {
@@ -280,7 +280,7 @@ impl PooledCard {
 ///
 /// When `pin` is Some, performs the corresponding PW1 verify *unless*
 /// the pooled handle already has that mode freshly verified and the
-/// card's PW1 mode permits multi-op use — then the verify is skipped.
+/// card's PW1 mode permits multi-op use; then the verify is skipped.
 /// If the skipped-verify op fails, we retry once on the same handle
 /// with an explicit verify (handles the case where the card state drifted
 /// under us). Persistent failure bubbles up as usual.
@@ -308,7 +308,7 @@ where
         let mut pc = pool.take().expect("matched above");
         let can_skip_verify = match pin {
             Some((PinMode::Signing, _)) => pc.pw1_sign_fresh && !pc.signing_pin_valid_once,
-            // PW1 mode 82 is multi-op by spec — no valid-once bit.
+            // PW1 mode 82 is multi-op by spec; no valid-once bit.
             Some((PinMode::User, _)) => pc.pw1_user_fresh,
             None => true,
         };
@@ -671,7 +671,7 @@ fn manufacturer_name(id: u16) -> String {
 /// internally and returns the raw signature bytes.
 ///
 /// Uses `openpgp-card`'s low-level `ocard::Transaction` (reached via
-/// `Card<Transaction>::card()`) rather than any high-level wrapper — the
+/// `Card<Transaction>::card()`) rather than any high-level wrapper; the
 /// wrappers rebuild a `DigestInfo` from a raw hash, and we already have
 /// the exact bytes `gpg-agent` wants signed.
 #[instrument(

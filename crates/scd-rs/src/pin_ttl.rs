@@ -1,6 +1,6 @@
 //! Resolves the PIN cache TTL from the `SCD_RS_PIN_TTL` environment variable.
 //!
-//! Accepts simple suffixed durations — `30s`, `10m`, `1h`, `2d`. A bare `0`
+//! Accepts simple suffixed durations; `30s`, `10m`, `1h`, `2d`. A bare `0`
 //! is treated as `0s` and disables the cache (every sign/decrypt re-prompts).
 //! Unrecognized values log a warning and fall through to the default.
 

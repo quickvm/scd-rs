@@ -18,9 +18,9 @@ pub enum ClientLine {
     Data(Vec<u8>),
     /// `END` line terminating an `INQUIRE` response payload.
     End,
-    /// `CAN` — client cancels the in-flight operation.
+    /// `CAN`; client cancels the in-flight operation.
     Cancel,
-    /// `BYE` — client closes the session.
+    /// `BYE`; client closes the session.
     Bye,
 }
 

@@ -14,7 +14,7 @@ use zeroize::Zeroize;
 ///
 /// `gpg-agent` allocates a 257-byte secure buffer for the PIN, fills it with
 /// the user's input, NULL-terminates, then sends the whole buffer on the
-/// Assuan wire — so we receive the PIN followed by trailing NULL padding.
+/// Assuan wire; so we receive the PIN followed by trailing NULL padding.
 /// Use C-string semantics to pull out just the meaningful prefix; otherwise
 /// the card sees a bogus over-length PIN and rejects it (burning a retry).
 pub async fn request_pin(
