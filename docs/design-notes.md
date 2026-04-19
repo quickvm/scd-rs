@@ -184,3 +184,115 @@ command stream:
 - gpg-agent sends `GETINFO version` and compares to its own version
   string. Returning `"2.4.9 (scd-rs 0.1.0)"` passes the "older than us"
   check while keeping the scd-rs tag visible in logs.
+
+## Phase 4 — production hardening
+
+### Trace diff vs stock scdaemon: zero load-bearing differences
+
+Formal wire-level comparison across `card-status`, `clearsign`, and
+`decrypt` workflows (`docs/assuan-traces/*.diff` + `.diff.notes.md`).
+Every delta classified Intentional (version tag, reader name),
+Advisory (`EXTCAP`, `DISP-SEX`, `KDF`, `UIF-*` — gpg-agent doesn't
+read them), or Ordering (interleaved vs batched `KEY-FPR`/`KEY-TIME`
+in LEARN — gpg-agent accumulates into state either way). Nothing
+gpg-agent acts on is missing.
+
+Generation is scripted: `scripts/capture-traces.sh` (stock),
+`scripts/capture-scdrs-traces.sh` (scd-rs, via a new `--trace-file`
+wire tap on `Connection`), and `scripts/normalize-trace.py` (strips
+timestamps, redacts `[[Confidential data not shown]]` for NEEDPIN
+prompts + responses, collapses volatile fields like `SIG-COUNTER` and
+random ciphertexts). Reproducible on any hardware with a card.
+
+The `--trace-file` tap redacts PIN bytes via a
+`trace_confidential: bool` flag on `Connection` that wraps the whole
+`inquire()` round when the keyword is NEEDPIN/PASSPHRASE/PIN. Covered
+by `trace_redacts_confidential_inquire` test — without it the raw
+trace would leak the user's card PIN.
+
+### Moved off `openpgp-card-sequoia` onto `openpgp-card 0.6`
+
+`openpgp-card-sequoia 0.2.2` pinned us to `openpgp-card 0.4.2`.
+Dropping the wrapper and going directly to `openpgp-card 0.6.1`
+removed ~1250 lines from `Cargo.lock` (sequoia-openpgp, nettle, and
+their transitive deps fall out of the graph entirely). API adaptation
+is mechanical — 0.6's `Card<Transaction>` state machine replaces the
+role `openpgp-card-sequoia` previously played.
+
+**No `read_card_info` perf improvement.** The plan (notes/02) targeted
+~1 s by dropping the wrapper, on the theory that Sequoia was doing
+the redundant ARD re-reads. Hardware measurement showed the re-reads
+live in `openpgp-card` itself — `ocard::keys::public_key` has a
+`// FIXME: caching` that re-fetches ARD on every per-slot pubkey
+read, byte-identical in 0.4.2 and 0.6.1. Cold `read_card_info` stays
+at ~3.6 s until that FIXME lands upstream. The dep cleanup is the
+real win.
+
+### Sliding PIN TTL with `SCD_RS_PIN_TTL`
+
+`CachedPin::expires_at` now resets on each successful cache hit, so
+an all-day coding session with `SCD_RS_PIN_TTL=8h` keeps the PIN
+alive as long as card activity continues, expires 8 h after the last
+op otherwise. TTL=0 disables the cache entirely (every sign/decrypt
+re-prompts). Format is the shared `<n><unit>` parser in
+`crate::duration_str` — `30s`/`10m`/`1h`/`2d`.
+
+### Card-handle pool (`SCD_RS_CARD_POOL_TTL`)
+
+Opt-in pool holding one warm `Card<Open>` across ops. Each op still
+starts its own PC/SC transaction (pcsc-shared semantics preserved);
+the `Card<Open>` / SCardConnect is the part that gets reused.
+
+Two-phase win on pool hit:
+1. Skip `Card::<Open>::new` (SELECT + ARD): ~500 ms saved.
+2. Skip `verify_pw1_sign` when the card's `pw1_cds_valid_once` flag
+   is false (Nitrokey default) and the pool has `pw1_sign_fresh`
+   set: ~600 ms saved. Same logic for PW1 mode 82 which is always
+   multi-op per spec.
+
+Measured on Nitrokey 3: repeat sign 3.5 s → 2.0 s (41% faster). The
+remaining ~2 s is the upstream ARD-re-read (~0.5 s) plus the card's
+RSA-4096 silicon (~1.6 s). If the FIXME lands upstream, warm sign
+should drop to ~1.5 s.
+
+Safety net: if the skip-verify attempt fails with any non-retryable
+card error, the freshness flag is cleared and the op retries with an
+explicit verify on the same handle. Handles the edge case where
+another PC/SC tenant momentarily claimed the card or the card reset
+itself mid-TTL.
+
+### Pre-existing Nitrokey firmware bug: fixed by vendor v1.8.3
+
+During Phase 4 trace-diff work, `gpg --decrypt` failed against the
+author's Nitrokey 3 (`v1.8.1` firmware) with card status word
+`0x6A80` ("Incorrect parameters in command data field"). The same
+ciphertext had decrypted cleanly in Phase 0. Diagnosis ruled out
+scd-rs, stock scdaemon, and keyring/card desync — fingerprint +
+keygrip matched on both sides, PSO:DECIPHER data field was correctly
+formed (1-byte RSA padding indicator + 512-byte modulus-sized
+ciphertext). The card itself was rejecting properly-formed
+RSA-4096 ciphertexts.
+
+Upgrading the Nitrokey to firmware v1.8.3 (`nitropy nk3 update`)
+resolved the issue. Neither v1.8.2 nor v1.8.3 call out an RSA
+PSO:DECIPHER fix in their changelogs, but the OpenPGP applet was
+touched in both. Filed here rather than in the trace-diff notes
+because it's a hardware/firmware fact, not a daemon fact.
+
+### scdaemon error constants cleanup
+
+Three of the original five error constants (`NOT_SUPPORTED`,
+`INV_ARG`, `NO_CARD`) had values that didn't match their
+libgpg-error names — they encoded `GPG_ERR_TOO_LARGE` (67),
+`GPG_ERR_UNUSABLE_PUBKEY` (53), and `GPG_ERR_INV_OBJ` (65)
+respectively. gpg-agent was tolerant of the mismatch so nothing
+broke, but the semantic/wire-code split was a trap. Renumbered to
+match names (60 / 45 / 112). `NO_CARD` becoming the canonical
+`GPG_ERR_CARD_NOT_PRESENT` enables gpg-agent's "please insert the
+card" prompt on missing-card paths.
+
+Also added `INV_ID` (118) during the trace-diff work, which stock
+scdaemon uses for "keygrip is on the card but the wrong usage for
+this op" (asking the signing key to decrypt). Previously we returned
+the misnamed `INV_ARG` for this case.
+
