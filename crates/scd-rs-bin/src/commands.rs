@@ -546,6 +546,7 @@ async fn sign_with_cached_pin(
         match sign_digest_info(ident, cached, digest_info) {
             Ok(sig) => {
                 tracing::debug!("PKSIGN served from PIN cache");
+                session.touch_pin();
                 return Ok(sig);
             }
             Err(scd_rs_card::CardError::BadPin { .. }) => {
@@ -604,6 +605,7 @@ async fn decrypt_with_cached_pin(
         match decrypt(ident, cached, ciphertext) {
             Ok(plain) => {
                 tracing::debug!("PKDECRYPT served from PIN cache");
+                session.touch_pin();
                 return Ok(plain);
             }
             Err(scd_rs_card::CardError::BadPin { .. }) => {

@@ -4,6 +4,7 @@
 //! these modules so they can be unit-tested.
 
 pub mod commands;
+pub mod pin_ttl;
 pub mod pinentry;
 pub mod state;
 

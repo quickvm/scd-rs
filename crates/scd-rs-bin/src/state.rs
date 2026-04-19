@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use scd_rs_card::{CardIdent, CardInfo, KeyUsage};
 use secrecy::{ExposeSecret, SecretBox};
 
+use crate::pin_ttl;
+
 /// Snapshot of the keys learned from a `LEARN --force` / `read_card_info`.
 #[derive(Debug, Clone, Default)]
 pub struct KnownKeys {
@@ -62,8 +64,12 @@ pub enum PinMode {
 }
 
 /// A PIN cached in-memory for the lifetime of the session or until the TTL
-/// expires. Matches gpg-agent's default-cache-ttl so repeat signs and
-/// decrypts within a session don't re-prompt the user.
+/// expires. TTL is a sliding window — each successful cache hit pushes
+/// `expires_at` forward by another full TTL, so an all-day session keeps
+/// the PIN valid as long as card operations keep happening.
+///
+/// TTL of zero disables the cache: `expires_at = now` on entry, so the
+/// very next `is_valid()` check returns false.
 pub struct CachedPin {
     bytes: SecretBox<Vec<u8>>,
     expires_at: Instant,
@@ -95,11 +101,13 @@ impl CachedPin {
     pub fn bytes(&self) -> &[u8] {
         self.bytes.expose_secret()
     }
-}
 
-/// Default TTL for the in-process PIN cache, chosen to match gpg-agent's
-/// `default-cache-ttl` of 600 seconds.
-pub const DEFAULT_PIN_TTL: Duration = Duration::from_secs(600);
+    /// Push the expiry window forward. Called after a cached PIN
+    /// successfully unlocks a card operation.
+    pub fn touch(&mut self, ttl: Duration) {
+        self.expires_at = Instant::now() + ttl;
+    }
+}
 
 /// One Assuan session's worth of state.
 #[derive(Debug, Default)]
@@ -131,9 +139,18 @@ impl Session {
             .map(CachedPin::bytes)
     }
 
-    /// Store a PIN in the cache with the default TTL.
+    /// Store a PIN in the cache with the configured TTL.
     pub fn cache_pin(&mut self, bytes: Vec<u8>) {
-        self.cached_pin = Some(CachedPin::new(bytes, DEFAULT_PIN_TTL));
+        self.cached_pin = Some(CachedPin::new(bytes, pin_ttl::configured()));
+    }
+
+    /// Reset the PIN cache expiry window. Called after a cached PIN has
+    /// successfully unlocked a card operation so that activity keeps the
+    /// cache alive (sliding window). No-op if the cache is empty.
+    pub fn touch_pin(&mut self) {
+        if let Some(pin) = self.cached_pin.as_mut() {
+            pin.touch(pin_ttl::configured());
+        }
     }
 
     pub fn clear_pin(&mut self) {
