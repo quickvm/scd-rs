@@ -22,6 +22,12 @@ mod err {
     pub const INV_ARG: u32 = 100_663_349;
     pub const NO_CARD: u32 = 100_663_361;
     pub const NO_SECRET_KEY: u32 = 100_663_313;
+    /// `GPG_ERR_INV_ID` (118) with source=SCD. Stock scdaemon returns this
+    /// when a PKSIGN/PKDECRYPT keygrip names a key that's on the card but
+    /// has the wrong usage for the requested operation (e.g. asking the
+    /// signing key to decrypt). Kept separate from `NO_SECRET_KEY` (which
+    /// means "no such key on card at all").
+    pub const INV_ID: u32 = 100_663_414;
 }
 
 /// The root command dispatcher.
@@ -161,7 +167,21 @@ async fn learn(
 /// Return the session's cached `CardInfo`, populating it on first access.
 /// Subsequent callers within the same session reuse the cached snapshot,
 /// which cuts several seconds off sign and decrypt flows.
+///
+/// Auto-enumerates the card if no `current_ident` is set — stock scdaemon
+/// caches card state across sessions and so can serve `KEYINFO --list`
+/// and other metadata queries before an explicit `SERIALNO`. scd-rs starts
+/// each session empty, so we fold in the enumeration step here rather
+/// than make gpg-agent retry after a `NO_CARD` error.
 fn ensure_card_info(session: &mut Session) -> Result<&CardInfo, HandlerError> {
+    if session.current_ident.is_none() {
+        let chosen = enumerate_cards()
+            .map_err(card_err)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| HandlerError::new(err::NO_CARD, "no OpenPGP card present"))?;
+        session.current_ident = Some(chosen.0);
+    }
     if session.cached_info.is_none() {
         tracing::info!("CardInfo cache miss — refreshing from card");
         let _ = refresh_card_info(session)?;
@@ -496,7 +516,7 @@ async fn pksign(
     let usage = resolve_key(session, keygrip)?;
     if usage != KeyUsage::Signing && usage != KeyUsage::Authentication {
         return Err(HandlerError::new(
-            err::INV_ARG,
+            err::INV_ID,
             format!("keygrip {keygrip} is not a signing key"),
         ));
     }
@@ -554,7 +574,7 @@ async fn pkdecrypt(
     let usage = resolve_key(session, keygrip)?;
     if usage != KeyUsage::Decryption {
         return Err(HandlerError::new(
-            err::INV_ARG,
+            err::INV_ID,
             format!("keygrip {keygrip} is not a decryption key"),
         ));
     }
