@@ -1,0 +1,49 @@
+name: PR Tests
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  DOCKER_RUN: >-
+    docker run --rm
+    -v "$PWD:/src"
+    -w /src
+    -e CARGO_TERM_COLOR=always
+    scd-rs:test
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Containerfile.test
+          tags: scd-rs:test
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Format
+        run: ${{ env.DOCKER_RUN }} cargo fmt --all -- --check
+
+      - name: Lint
+        run: ${{ env.DOCKER_RUN }} cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: ${{ env.DOCKER_RUN }} cargo test --workspace
+
+      - name: Release build
+        run: ${{ env.DOCKER_RUN }} cargo build --release --workspace

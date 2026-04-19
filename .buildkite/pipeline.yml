@@ -4,7 +4,7 @@ steps:
     command: |
       set -euo pipefail
       echo "+++ :docker: Building test container"
-      podman build -t scd-rs-agent:test -f Containerfile.test .
+      podman build -t scd-rs:test -f Containerfile.test .
 
   - wait: ~
 
@@ -15,17 +15,23 @@ steps:
         command: |
           echo "+++ :rustfmt: cargo fmt --check"
           podman run --rm -v "$$PWD:/src:z" -w /src \
-            scd-rs-agent:test cargo fmt --all -- --check
+            scd-rs:test cargo fmt --all -- --check
 
       - label: ":clippy: Lint"
         command: |
           echo "+++ :clippy: cargo clippy"
           podman run --rm -v "$$PWD:/src:z" -w /src \
-            scd-rs-agent:test \
+            scd-rs:test \
             cargo clippy --workspace --all-targets -- -D warnings
 
       - label: ":cargo: Test"
         command: |
           echo "+++ :cargo: cargo test"
           podman run --rm -v "$$PWD:/src:z" -w /src \
-            scd-rs-agent:test cargo test --workspace
+            scd-rs:test cargo test --workspace
+
+      - label: ":cargo: Release build"
+        command: |
+          echo "+++ :cargo: cargo build --release"
+          podman run --rm -v "$$PWD:/src:z" -w /src \
+            scd-rs:test cargo build --release --workspace
