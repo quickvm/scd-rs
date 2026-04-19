@@ -10,11 +10,15 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use scd_rs::{pin_ttl, pool_ttl, ScdHandler};
 use scd_rs_assuan::{serve_stdio_with_trace, AssuanServer, TraceSink};
-use scd_rs_bin::{pin_ttl, pool_ttl, ScdHandler};
 
 #[derive(Parser, Debug)]
-#[command(name = "scd-rs", about = "Sequoia-backed scdaemon replacement")]
+#[command(
+    name = "scd-rs",
+    version,
+    about = "scdaemon-compatible OpenPGP card daemon for gpg-agent"
+)]
 struct Cli {
     /// gpg-agent compat. Alias for stdio server mode (the default).
     #[arg(long)]

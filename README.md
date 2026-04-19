@@ -31,10 +31,12 @@ rewrite `scdaemon` in Rust.
 
 Yeah, yeah, we know. A vibe-coded project that sits in your cryptographic
 critical path. We don't care. Upstream bug fixes on `scdaemon` aren't happening
-and the brittleness of the whole toolchain hit a breaking point for us. Use this
-at your own risk. It fixes our pain, and we're open-sourcing it in the hope that
-it spares other Nitrokey (and maybe Yubikey, untested!) users from yet more RSI
-typing their PIN every time they want to sign a git commit.
+and the brittleness of the whole toolchain hit a breaking point for us. It fixes
+our pain, and we're open-sourcing it in the hope that it spares other Nitrokey 
+(and maybe Yubikey, untested!) users from yet more RSI typing their PIN every 
+time they want to sign a git commit.
+
+That said, Use this at _your_ own risk.
 
 All three canonical workflows (`gpg --card-status`, `gpg --clearsign`,
 `gpg --decrypt`) are validated against stock scdaemon via a formal Assuan-wire
@@ -52,7 +54,7 @@ author's card). ECC paths are wired but not hardware-validated.
 ### 1. Install
 
 ```bash
-cargo install --git https://github.com/quickvm/scd-rs scd-rs-bin
+cargo install --git https://github.com/quickvm/scd-rs scd-rs
 ```
 
 Installs `scd-rs` and `scd-rs-probe` into `~/.cargo/bin`.
@@ -119,6 +121,30 @@ All tuning is via environment variables:
 | `SCD_RS_CARD_POOL_TTL` | `0` (off) | How long to hold a PC/SC handle warm across operations. When enabled, back-to-back signs skip the ~500 ms re-open and, when the card's `pw1_cds_valid_once` flag is false (Nitrokey default), the ~600 ms PW1 verify. Start with `5s`. |
 | `SCD_RS_TRACE` via `--trace-file` | none | Tee every Assuan line to a file with `<- ` / `-> ` direction markers. Only meaningful when debugging scd-rs vs gpg-agent protocol questions. |
 
+### How the two caches stack
+
+`SCD_RS_PIN_TTL` and `SCD_RS_CARD_POOL_TTL` operate at different
+layers. The PIN cache is a **human-facing** cache: it skips the
+pinentry popup and the `INQUIRE NEEDPIN` round-trip by supplying PIN
+bytes scd-rs already has in memory. The card-handle pool is a
+**hardware-facing** cache: it skips the `Card::<Open>::new` APDUs
+(SELECT + ARD, ~500 ms) and, when the card permits multi-op PW1, the
+`VERIFY PW1` APDU (~600 ms).
+
+What each combination removes from a sign/decrypt:
+
+| `SCD_RS_PIN_TTL` | `SCD_RS_CARD_POOL_TTL` | pinentry popup | card SELECT + ARD | VERIFY PW1 APDU | PSO APDU |
+|---|---|---|---|---|---|
+| `0`   | `0`  | runs       | runs              | runs                      | runs |
+| `10m` | `0`  | **skipped** | runs              | runs                      | runs |
+| `0`   | `5s` | runs       | **skipped** (warm) | **skipped** (card permits) | runs |
+| `10m` | `5s` | **skipped** | **skipped** (warm) | **skipped** (card permits) | runs |
+
+The PSO operation itself (RSA on the card's crypto core) is always
+paid, it's the only thing that actually signs or decrypts. Everything
+else is overhead, and with both caches warm on back-to-back signs all
+of it drops out.
+
 ### PIN cache
 
 The PIN cache is per Assuan connection (i.e. per gpg-agent ↔ scd-rs
@@ -167,7 +193,7 @@ Three crates:
 crates/
 ├── scd-rs-card       OpenPGP card layer (openpgp-card 0.6, PC/SC via card-backend-pcsc)
 ├── scd-rs-assuan     Assuan protocol server (hand-rolled; no maintained Rust Assuan crate)
-└── scd-rs-bin        Daemon + probe binaries
+└── scd-rs            Daemon + probe binaries
     ├── bin/scd-rs         the daemon gpg-agent talks to
     └── bin/scd-rs-probe   hardware validation harness (enumerate / info / loop)
 ```
@@ -175,7 +201,7 @@ crates/
 `scd-rs-card` is the only code that holds card handles. Every other
 layer calls into it via a `&mut Option<PooledCard>` plumbed through
 `Session`. `scd-rs-assuan` is framing + dispatch; it knows nothing about
-card state. `scd-rs-bin` binds the two.
+card state. The `scd-rs` crate binds the two.
 
 ### Handle discipline
 
@@ -187,7 +213,7 @@ There is exactly one place in the crate that calls `Card::<Open>::new`
 
 ### Session state
 
-`scd_rs_bin::state::Session` carries all per-connection state:
+`scd_rs::state::Session` carries all per-connection state:
 
 - `current_ident`: last resolved card AID
 - `cached_info`: `CardInfo` snapshot (populated lazily, survives RESTART)
@@ -296,7 +322,7 @@ done
 Review each `.diff` and classify deltas into Load-bearing (stock
 emits, gpg-agent depends on), Advisory (stock emits, gpg-agent
 tolerates missing), or Intentional (scd-rs emits something distinct
-and known). The design goal is zero Load-bearing deltas — the current
+and known). The design goal is zero Load-bearing deltas; the current
 workspace ships with that achieved against Nitrokey 3.
 
 ### Building inside a container (mirrors CI)

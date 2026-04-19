@@ -708,18 +708,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "scd-rs-assuan"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "scd-rs-bin"
+name = "scd-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -732,6 +721,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zeroize",
+]
+
+[[package]]
+name = "scd-rs-assuan"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

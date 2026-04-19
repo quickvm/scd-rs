@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/scd-rs-card",
     "crates/scd-rs-assuan",
-    "crates/scd-rs-bin",
+    "crates/scd-rs",
 ]
 
 [workspace.package]

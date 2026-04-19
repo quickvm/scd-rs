@@ -9,13 +9,14 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use scd_rs_bin::pool_ttl;
+use scd_rs::pool_ttl;
 use scd_rs_card::{enumerate_cards, read_card_info, CardError, CardInfo, KeyInfo};
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "scd-rs-probe",
+    version,
     about = "Exercise scd-rs-card against real hardware"
 )]
 struct Cli {

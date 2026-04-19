@@ -1,5 +1,5 @@
 [package]
-name = "scd-rs-bin"
+name = "scd-rs"
 description = "scdaemon-compatible daemon and hardware probe binaries"
 version.workspace = true
 edition.workspace = true
