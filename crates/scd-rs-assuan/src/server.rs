@@ -5,9 +5,9 @@
 //! drives a `CommandHandler` for the lifetime of the session.
 
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -15,6 +15,10 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::framing::encode_data_lines;
 use crate::protocol::{parse_client_line, ClientLine, ProtocolError};
+
+/// Shared handle to an open trace file. Cloned across all Connections that
+/// should tee into the same sink; the Mutex serializes concurrent writers.
+pub type TraceSink = Arc<Mutex<std::fs::File>>;
 
 /// Error a `CommandHandler` can return to have the server emit `ERR`.
 #[derive(Debug, Error)]
@@ -81,6 +85,11 @@ type BoxedWriter = Box<dyn AsyncWrite + Send + Unpin>;
 pub struct Connection {
     reader: BufReader<BoxedReader>,
     writer: BoxedWriter,
+    trace: Option<TraceSink>,
+    /// When true, `trace_io` emits `[[Confidential data not shown]]` in
+    /// place of the actual wire bytes. Scoped to a single `inquire()` call
+    /// whose keyword names a secret (PIN, passphrase).
+    trace_confidential: bool,
 }
 
 impl Connection {
@@ -94,6 +103,8 @@ impl Connection {
         Self {
             reader: BufReader::new(reader),
             writer,
+            trace: None,
+            trace_confidential: false,
         }
     }
 
@@ -107,6 +118,31 @@ impl Connection {
         )
     }
 
+    /// Tee every line read from and written to this connection into `sink`.
+    /// Each line is prefixed with `<- ` (client→server) or `-> ` (server→
+    /// client) and a trailing newline; matches the direction convention
+    /// stock scdaemon's `debug ipc` log uses.
+    pub fn set_trace(&mut self, sink: TraceSink) {
+        self.trace = Some(sink);
+    }
+
+    fn trace_io(&self, prefix: &[u8], bytes: &[u8]) {
+        let Some(sink) = &self.trace else {
+            return;
+        };
+        let Ok(mut f) = sink.lock() else {
+            return;
+        };
+        let _ = f.write_all(prefix);
+        if self.trace_confidential {
+            let _ = f.write_all(b"[[Confidential data not shown]]\n");
+        } else {
+            let stripped = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+            let _ = f.write_all(stripped);
+            let _ = f.write_all(b"\n");
+        }
+    }
+
     /// Read one line and parse it. `Ok(None)` signals EOF (peer closed).
     pub async fn read_line(&mut self) -> Result<Option<ClientLine>, ServerError> {
         let mut buf = Vec::with_capacity(256);
@@ -114,6 +150,7 @@ impl Connection {
         if n == 0 {
             return Ok(None);
         }
+        self.trace_io(b"<- ", &buf);
         Ok(Some(parse_client_line(&buf)?))
     }
 
@@ -147,6 +184,7 @@ impl Connection {
         for mut line in encode_data_lines(bytes) {
             line.push(b'\n');
             self.writer.write_all(&line).await?;
+            self.trace_io(b"-> ", &line);
         }
         self.writer.flush().await?;
         Ok(())
@@ -159,6 +197,25 @@ impl Connection {
     /// The caller is responsible for zeroising the returned bytes if they
     /// contain secret material (e.g. a PIN).
     pub async fn inquire(
+        &mut self,
+        keyword: &str,
+        args: &str,
+    ) -> Result<Vec<u8>, ServerError> {
+        // NEEDPIN/PASSPHRASE/PIN prompts carry the card's serial and holder
+        // in the prompt, and the client's D/END response carries the PIN
+        // itself. Redact in the trace file for the duration of the inquire
+        // round so the captured transcript matches stock scdaemon's
+        // `[[Confidential data not shown]]` behavior.
+        let is_confidential = matches!(keyword, "NEEDPIN" | "PASSPHRASE" | "PIN");
+        if is_confidential {
+            self.trace_confidential = true;
+        }
+        let result = self.inquire_inner(keyword, args).await;
+        self.trace_confidential = false;
+        result
+    }
+
+    async fn inquire_inner(
         &mut self,
         keyword: &str,
         args: &str,
@@ -202,6 +259,7 @@ impl Connection {
     async fn write_line(&mut self, bytes: &[u8]) -> Result<(), ServerError> {
         self.writer.write_all(bytes).await?;
         self.writer.flush().await?;
+        self.trace_io(b"-> ", bytes);
         Ok(())
     }
 
@@ -217,6 +275,7 @@ pub struct AssuanServer<H> {
     listener: UnixListener,
     handler: Arc<H>,
     socket_path: PathBuf,
+    trace: Option<TraceSink>,
 }
 
 impl<H: CommandHandler> AssuanServer<H> {
@@ -232,7 +291,15 @@ impl<H: CommandHandler> AssuanServer<H> {
             listener,
             handler: Arc::new(handler),
             socket_path,
+            trace: None,
         })
+    }
+
+    /// Tee every accepted connection's wire traffic into `sink`.
+    #[must_use]
+    pub fn with_trace(mut self, sink: TraceSink) -> Self {
+        self.trace = Some(sink);
+        self
     }
 
     /// Accept connections forever, spawning a task per connection.
@@ -240,8 +307,12 @@ impl<H: CommandHandler> AssuanServer<H> {
         loop {
             let (stream, _peer) = self.listener.accept().await?;
             let handler = Arc::clone(&self.handler);
+            let trace = self.trace.clone();
             tokio::spawn(async move {
-                let conn = Connection::from_unix_stream(stream);
+                let mut conn = Connection::from_unix_stream(stream);
+                if let Some(sink) = trace {
+                    conn.set_trace(sink);
+                }
                 if let Err(e) = drive_session(conn, handler).await {
                     tracing::warn!(error = %e, "session ended with error");
                 }
@@ -254,7 +325,18 @@ impl<H: CommandHandler> AssuanServer<H> {
 /// scdaemon-compat server mode where `gpg-agent` invokes us as a child
 /// process via `assuan_pipe_connect`.
 pub async fn serve_stdio<H: CommandHandler>(handler: H) -> Result<(), ServerError> {
-    let conn = Connection::from_stdio();
+    serve_stdio_with_trace(handler, None).await
+}
+
+/// As `serve_stdio`, but with optional wire-level tracing.
+pub async fn serve_stdio_with_trace<H: CommandHandler>(
+    handler: H,
+    trace: Option<TraceSink>,
+) -> Result<(), ServerError> {
+    let mut conn = Connection::from_stdio();
+    if let Some(sink) = trace {
+        conn.set_trace(sink);
+    }
     drive_session(conn, Arc::new(handler)).await
 }
 

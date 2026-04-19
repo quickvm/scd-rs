@@ -5,10 +5,41 @@
 //! its argument back as a `D` line.
 
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 
 use scd_rs_assuan::{AssuanServer, CommandHandler, Connection, HandlerError};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+
+/// Handler that issues an INQUIRE NEEDPIN on receiving `PROBE_PIN`. Used
+/// by `trace_redacts_confidential_inquire` to verify the trace-file tee
+/// masks PIN-carrying traffic.
+struct PinProbeHandler;
+
+impl CommandHandler for PinProbeHandler {
+    type Session = ();
+
+    fn handle(
+        &self,
+        _session: &mut (),
+        conn: &mut Connection,
+        verb: &str,
+        _args: &str,
+    ) -> impl Future<Output = Result<(), HandlerError>> + Send {
+        let verb = verb.to_string();
+        async move {
+            if verb == "PROBE_PIN" {
+                let _ = conn
+                    .inquire("NEEDPIN", "Please unlock card 1234")
+                    .await
+                    .map_err(|e| HandlerError::new(100, e.to_string()))?;
+                Ok(())
+            } else {
+                Err(HandlerError::new(100, format!("unknown verb {verb}")))
+            }
+        }
+    }
+}
 
 struct EchoHandler;
 
@@ -110,6 +141,126 @@ async fn echo_unknown_verb_returns_err() {
     assert!(err.starts_with("ERR 100"), "got: {err}");
 
     server_task.abort();
+}
+
+#[tokio::test]
+async fn trace_file_records_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("assuan.sock");
+    let trace_path = dir.path().join("wire.trace");
+    let trace_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&trace_path)
+        .unwrap();
+    let trace = Arc::new(Mutex::new(trace_file));
+
+    let server = AssuanServer::bind(&path, EchoHandler)
+        .unwrap()
+        .with_trace(trace);
+    let server_task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::task::yield_now().await;
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let _greeting = lines.next_line().await.unwrap().unwrap();
+
+    write.write_all(b"ECHO hello\n").await.unwrap();
+    write.flush().await.unwrap();
+    let _data = lines.next_line().await.unwrap().unwrap();
+    let _ok = lines.next_line().await.unwrap().unwrap();
+
+    write.write_all(b"BYE\n").await.unwrap();
+    write.flush().await.unwrap();
+    let _bye = lines.next_line().await.unwrap().unwrap();
+
+    server_task.abort();
+
+    let contents = std::fs::read_to_string(&trace_path).unwrap();
+    // Greeting from server → client.
+    assert!(contents.contains("-> OK scd-rs ready"), "trace: {contents}");
+    // Command from client → server.
+    assert!(contents.contains("<- ECHO hello"), "trace: {contents}");
+    // D line emitted by handler.
+    assert!(contents.contains("-> D hello"), "trace: {contents}");
+    // Every trace line has a direction marker.
+    for line in contents.lines() {
+        assert!(
+            line.starts_with("-> ") || line.starts_with("<- "),
+            "unmarked trace line: {line}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn trace_redacts_confidential_inquire() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("assuan.sock");
+    let trace_path = dir.path().join("wire.trace");
+    let trace_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&trace_path)
+        .unwrap();
+    let trace = Arc::new(Mutex::new(trace_file));
+
+    let server = AssuanServer::bind(&path, PinProbeHandler)
+        .unwrap()
+        .with_trace(trace);
+    let server_task = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::task::yield_now().await;
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let _greeting = lines.next_line().await.unwrap().unwrap();
+
+    write.write_all(b"PROBE_PIN\n").await.unwrap();
+    write.flush().await.unwrap();
+
+    // Read the INQUIRE NEEDPIN line emitted by the handler.
+    let inquire = lines.next_line().await.unwrap().unwrap();
+    assert!(inquire.starts_with("INQUIRE NEEDPIN"), "got: {inquire}");
+
+    // Respond with a fake PIN and END to close the inquire round.
+    write.write_all(b"D 54321\n").await.unwrap();
+    write.write_all(b"END\n").await.unwrap();
+    write.flush().await.unwrap();
+
+    let _ok = lines.next_line().await.unwrap().unwrap();
+
+    write.write_all(b"BYE\n").await.unwrap();
+    write.flush().await.unwrap();
+    let _bye = lines.next_line().await.unwrap().unwrap();
+
+    server_task.abort();
+
+    let contents = std::fs::read_to_string(&trace_path).unwrap();
+
+    // The actual PIN bytes must never land in the trace file.
+    assert!(!contents.contains("54321"), "PIN leaked: {contents}");
+    // The INQUIRE prompt carries a card serial that also shouldn't land.
+    assert!(
+        !contents.contains("Please unlock card 1234"),
+        "prompt leaked: {contents}"
+    );
+    // Both directions of the confidential exchange must be redacted.
+    assert!(
+        contents.contains("-> [[Confidential data not shown]]"),
+        "server-side redaction missing: {contents}"
+    );
+    assert!(
+        contents.contains("<- [[Confidential data not shown]]"),
+        "client-side redaction missing: {contents}"
+    );
+    // Non-confidential traffic (the greeting and command) stays visible.
+    assert!(contents.contains("-> OK scd-rs ready"), "trace: {contents}");
+    assert!(contents.contains("<- PROBE_PIN"), "trace: {contents}");
 }
 
 #[tokio::test]

@@ -6,10 +6,11 @@
 //! - `--socket <path>`: bind a Unix socket for direct testing / debugging.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use scd_rs_assuan::{serve_stdio, AssuanServer};
+use scd_rs_assuan::{serve_stdio_with_trace, AssuanServer, TraceSink};
 use scd_rs_bin::ScdHandler;
 
 #[derive(Parser, Debug)]
@@ -40,6 +41,12 @@ struct Cli {
     #[arg(long)]
     log_file: Option<PathBuf>,
 
+    /// Tee every Assuan wire line to this file with `<- ` / `-> ` direction
+    /// markers. Intended for trace-diffing against stock scdaemon's
+    /// `debug ipc` output — see scripts/capture-scdrs-traces.sh.
+    #[arg(long)]
+    trace_file: Option<PathBuf>,
+
     /// Accepted for compat — scdaemon uses this for its debug subsystem
     /// masks. We treat the flag as enabling debug-level tracing.
     #[arg(long)]
@@ -54,18 +61,19 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| std::env::var_os("SCD_RS_LOG").map(PathBuf::from));
     init_tracing(log_file.as_deref(), cli.debug.is_some())?;
+    let trace = open_trace(cli.trace_file.as_deref())?;
     let _ = (cli.server, cli.multi_server, cli.homedir, cli.daemon);
 
     if let Some(path) = cli.socket {
-        run_unix(path).await
+        run_unix(path, trace).await
     } else {
         tracing::info!("serving on stdio");
-        serve_stdio(ScdHandler).await?;
+        serve_stdio_with_trace(ScdHandler, trace).await?;
         Ok(())
     }
 }
 
-async fn run_unix(socket: PathBuf) -> Result<()> {
+async fn run_unix(socket: PathBuf, trace: Option<TraceSink>) -> Result<()> {
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("create socket parent {}: {e}", parent.display()))?;
@@ -75,9 +83,25 @@ async fn run_unix(socket: PathBuf) -> Result<()> {
             .map_err(|e| anyhow!("remove stale socket {}: {e}", socket.display()))?;
     }
     tracing::info!(path = %socket.display(), "binding unix socket");
-    let server = AssuanServer::bind(&socket, ScdHandler)?;
+    let mut server = AssuanServer::bind(&socket, ScdHandler)?;
+    if let Some(sink) = trace {
+        server = server.with_trace(sink);
+    }
     server.serve().await?;
     Ok(())
+}
+
+fn open_trace(path: Option<&std::path::Path>) -> Result<Option<TraceSink>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| anyhow!("open trace file {}: {e}", path.display()))?;
+    tracing::info!(path = %path.display(), "tracing Assuan wire to file");
+    Ok(Some(Arc::new(Mutex::new(file))))
 }
 
 fn init_tracing(log_file: Option<&std::path::Path>, verbose: bool) -> Result<()> {

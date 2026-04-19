@@ -14,6 +14,12 @@ Cargo.lock.bak
 .env.local
 *.log
 !docs/assuan-traces/*.log
+# scd-rs trace captures contain the user's card PIN in plaintext: the
+# `--trace-file` tee logs the raw D line of the PIN inquire response,
+# whereas stock scdaemon's `debug ipc` writes `[[Confidential data not
+# shown]]`. Keep the raw captures local until scd-rs-side redaction
+# lands; the normalized `.diff` files are safe to commit.
+docs/assuan-traces/scdrs-*.log
 
 # Tool-local state
 .claude/

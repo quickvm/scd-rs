@@ -9,4 +9,7 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 
-pub use server::{serve_stdio, AssuanServer, CommandHandler, Connection, HandlerError, ServerError};
+pub use server::{
+    serve_stdio, serve_stdio_with_trace, AssuanServer, CommandHandler, Connection, HandlerError,
+    ServerError, TraceSink,
+};
