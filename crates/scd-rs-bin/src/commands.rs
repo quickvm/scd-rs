@@ -13,21 +13,29 @@ use crate::pinentry::{build_prompt, request_pin};
 use crate::pool_ttl;
 use crate::state::{KnownKeys, Session};
 
-/// Assuan error codes mirrored from gpg-agent / scdaemon.
-///
-/// The full space is defined in libgpg-error. We only surface the handful
-/// the protocol actually uses.
+/// Assuan error codes mirrored from gpg-agent / scdaemon. Values are
+/// `(GPG_ERR_SOURCE_SCD << 24) | <gpg-error code>` — the canonical
+/// libgpg-error numbering you can cross-check with `gpg-error --list`.
 mod err {
-    pub const GENERAL: u32 = 100_663_297; // GPG_ERR_GENERAL with source=SCD
-    pub const NOT_SUPPORTED: u32 = 100_663_363;
-    pub const INV_ARG: u32 = 100_663_349;
-    pub const NO_CARD: u32 = 100_663_361;
+    /// `GPG_ERR_GENERAL` (1). Catch-all for "something went wrong and we
+    /// don't have a better classification".
+    pub const GENERAL: u32 = 100_663_297;
+    /// `GPG_ERR_NO_SECKEY` (17). The requested keygrip isn't on the card
+    /// at all — distinct from `INV_ID`, which covers "on the card, wrong
+    /// usage".
     pub const NO_SECRET_KEY: u32 = 100_663_313;
-    /// `GPG_ERR_INV_ID` (118) with source=SCD. Stock scdaemon returns this
-    /// when a PKSIGN/PKDECRYPT keygrip names a key that's on the card but
-    /// has the wrong usage for the requested operation (e.g. asking the
-    /// signing key to decrypt). Kept separate from `NO_SECRET_KEY` (which
-    /// means "no such key on card at all").
+    /// `GPG_ERR_INV_ARG` (45). Malformed command arguments (missing
+    /// keygrip, bad hex, etc.).
+    pub const INV_ARG: u32 = 100_663_341;
+    /// `GPG_ERR_NOT_SUPPORTED` (60). Verb or option the daemon doesn't
+    /// handle. gpg-agent tolerates this and moves on.
+    pub const NOT_SUPPORTED: u32 = 100_663_356;
+    /// `GPG_ERR_CARD_NOT_PRESENT` (112). No `OpenPGP` card visible on any
+    /// connected reader, or SERIALNO hasn't been run yet in this session.
+    pub const NO_CARD: u32 = 100_663_408;
+    /// `GPG_ERR_INV_ID` (118). PKSIGN/PKDECRYPT keygrip names a key that's
+    /// on the card but has the wrong usage for the requested operation
+    /// (e.g. asking the signing key to decrypt).
     pub const INV_ID: u32 = 100_663_414;
 }
 
