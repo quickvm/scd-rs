@@ -1,6 +1,6 @@
 [package]
 name = "scd-rs-card"
-description = "Sequoia-backed OpenPGP card access with per-operation handle discipline"
+description = "OpenPGP card access for scd-rs with per-operation handle discipline"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,8 +12,6 @@ authors.workspace = true
 card-backend = { workspace = true }
 card-backend-pcsc = { workspace = true }
 openpgp-card = { workspace = true }
-openpgp-card-sequoia = { workspace = true }
-sequoia-openpgp = { workspace = true }
 sha1 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

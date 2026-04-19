@@ -1,18 +1,29 @@
-//! Sequoia-backed `OpenPGP` card access for `scd-rs`.
+//! `OpenPGP` card access for `scd-rs`.
 //!
 //! Enforces per-operation PC/SC handle discipline: every externally visible
-//! operation opens a fresh `PcscBackend` → `Card<Open>` → `Card<Transaction>`
-//! chain and drops it before returning. Nothing in this crate is permitted to
-//! retain a card handle across calls.
+//! operation opens a fresh `PcscBackend` → `Card` → `Transaction` chain and
+//! drops it before returning. Nothing in this crate is permitted to retain a
+//! card handle across calls.
+//!
+//! Uses the `openpgp-card` 0.6 `Card<Transaction>` state machine. That layer
+//! caches a single `ApplicationRelatedData` read for the lifetime of the
+//! transaction, so fingerprints / PW status / algorithm attributes /
+//! key-generation times all come out of one APDU. Per-slot public-key reads
+//! still cost two APDUs each (the upstream `ocard::keys::public_key` has a
+//! standing `FIXME: caching` that re-fetches ARD before parsing the pubkey
+//! response, same story in 0.4 and 0.6).
 
 use std::fmt;
 
 use card_backend::CardBackend;
 use card_backend_pcsc::PcscBackend;
-use openpgp_card::Card as OcCard;
-use openpgp_card_sequoia::state::{Open, Transaction};
-use openpgp_card_sequoia::types::{Error as OcError, KeyType, StatusBytes};
-use openpgp_card_sequoia::Card;
+use openpgp_card::ocard::algorithm::AlgorithmAttributes;
+use openpgp_card::ocard::crypto::PublicKeyMaterial;
+use openpgp_card::ocard::data::{Fingerprint, KeyGenerationTime, KeySet};
+use openpgp_card::ocard::{KeyType, StatusBytes};
+use openpgp_card::state::{Open, Transaction};
+use openpgp_card::{Card, Error as OcError};
+use secrecy::SecretBox;
 use thiserror::Error;
 use tracing::{debug, instrument};
 
@@ -74,6 +85,14 @@ impl KeyUsage {
             Self::Signing => KeyType::Signing,
             Self::Decryption => KeyType::Decryption,
             Self::Authentication => KeyType::Authentication,
+        }
+    }
+
+    fn pick_from_key_set<T>(self, set: &KeySet<T>) -> Option<&T> {
+        match self {
+            Self::Signing => set.signature(),
+            Self::Decryption => set.decryption(),
+            Self::Authentication => set.authentication(),
         }
     }
 }
@@ -200,8 +219,8 @@ fn full_aid(app: u8, version_bcd: u16, manufacturer: u16, serial: u32) -> String
     format!("D276000124{app:02X}{version_bcd:04X}{manufacturer:04X}{serial:08X}0000")
 }
 
-/// Parse an scdaemon-style full AID into the short ident
-/// (`MANUF:SERIAL`) that `openpgp_card_sequoia::Card::open_by_ident` expects.
+/// Parse an scdaemon-style full AID into the short `MANUF:SERIAL` ident
+/// that the `openpgp-card` transaction layer uses internally.
 fn short_ident_from_full(full: &str) -> Result<String> {
     let upper = full.to_ascii_uppercase();
     if upper.len() != 32 || !upper.starts_with("D276000124") {
@@ -215,50 +234,10 @@ fn short_ident_from_full(full: &str) -> Result<String> {
     Ok(format!("{manuf}:{serial}"))
 }
 
-/// Open a transaction against the requested card, run `f`, then drop the
-/// backend / card / transaction stack before returning.
-///
-/// `ident` accepts the full AID hex (`D276...`) that `gpg-agent` sends; it is
-/// translated to the short `MANUF:SERIAL` form internally. Pass `None` to pick
-/// the first card PC/SC returns.
-#[instrument(level = "debug", skip(f), fields(ident = ident.unwrap_or("<any>")))]
-pub fn with_card<R, F>(ident: Option<&str>, f: F) -> Result<R>
-where
-    F: FnOnce(&mut Card<Transaction<'_>>) -> Result<R>,
-{
-    let backends = PcscBackend::card_backends(None).map_err(|e| CardError::Pcsc {
-        message: e.to_string(),
-        retryable: true,
-    })?;
-
-    let mut card: Card<Open> = if let Some(full) = ident {
-        let short = short_ident_from_full(full)?;
-        Card::<Open>::open_by_ident(backends, &short)?
-    } else {
-        let mut it = backends;
-        let backend = it
-            .next()
-            .ok_or(CardError::NotFound)?
-            .map_err(|e| CardError::Pcsc {
-                message: e.to_string(),
-                retryable: true,
-            })?;
-        Card::<Open>::new(backend)?
-    };
-
-    let mut txn = card.transaction()?;
-    debug!("transaction open");
-    let result = f(&mut txn);
-    drop(txn);
-    drop(card);
-    debug!(success = result.is_ok(), "transaction closed");
-    result
-}
-
 /// Enumerate every `OpenPGP` card currently visible via PC/SC.
 ///
 /// Returns full scdaemon-style AID strings suitable to pass back to
-/// `with_card`.
+/// `read_card_info`, `sign_digest_info`, or `decrypt`.
 #[instrument(level = "debug")]
 pub fn enumerate_cards() -> Result<Vec<CardIdent>> {
     let backends = PcscBackend::card_backends(None).map_err(|e| CardError::Pcsc {
@@ -268,7 +247,7 @@ pub fn enumerate_cards() -> Result<Vec<CardIdent>> {
 
     let mut idents = Vec::new();
     for backend in backends {
-        let backend = backend.map_err(|e| CardError::Pcsc {
+        let backend: Box<dyn CardBackend + Send + Sync> = backend.map_err(|e| CardError::Pcsc {
             message: e.to_string(),
             retryable: true,
         })?;
@@ -286,11 +265,24 @@ pub fn enumerate_cards() -> Result<Vec<CardIdent>> {
 }
 
 /// Fetch the full card snapshot `gpg-agent` needs for `LEARN --force`.
+///
+/// All the ARD-derived metadata (fingerprints, PW status, algorithm
+/// attributes, key-generation times) comes out of a single ARD read that
+/// `Card<Transaction>` caches on entry. Cardholder DO, URL, and the
+/// signature counter are one APDU each. Per-slot public-key reads still
+/// cost two APDUs each because `public_key_material` internally re-reads
+/// ARD (the upstream `// FIXME: caching`).
 #[instrument(level = "debug", fields(ident))]
 pub fn read_card_info(ident: &str) -> Result<CardInfo> {
-    with_card(Some(ident), |txn| {
+    let t_start = std::time::Instant::now();
+    let result = with_card_txn(ident, |txn| {
         let app_id = txn.application_identifier()?;
         let pws = txn.pw_status_bytes()?;
+        let fingerprints = txn.fingerprints().ok();
+        let gen_times = txn.key_generation_times().ok();
+        let aa_sig = txn.algorithm_attributes(KeyType::Signing).ok();
+        let aa_dec = txn.algorithm_attributes(KeyType::Decryption).ok();
+        let aa_aut = txn.algorithm_attributes(KeyType::Authentication).ok();
 
         let chv_status = ChvStatus {
             signing_pin_multi_op: !pws.pw1_cds_valid_once(),
@@ -311,13 +303,32 @@ pub fn read_card_info(ident: &str) -> Result<CardInfo> {
             .as_ref()
             .and_then(|c| c.lang())
             .map(|langs| langs.iter().map(ToString::to_string).collect());
+
         let pubkey_url = txn.url().ok().filter(|s| !s.is_empty());
         let sig_counter = txn.digital_signature_count().unwrap_or(0);
 
         let keys = [
-            key_info(txn, KeyUsage::Signing)?,
-            key_info(txn, KeyUsage::Decryption)?,
-            key_info(txn, KeyUsage::Authentication)?,
+            build_key_info(
+                txn,
+                KeyUsage::Signing,
+                fingerprints.as_ref(),
+                gen_times.as_ref(),
+                aa_sig.as_ref(),
+            ),
+            build_key_info(
+                txn,
+                KeyUsage::Decryption,
+                fingerprints.as_ref(),
+                gen_times.as_ref(),
+                aa_dec.as_ref(),
+            ),
+            build_key_info(
+                txn,
+                KeyUsage::Authentication,
+                fingerprints.as_ref(),
+                gen_times.as_ref(),
+                aa_aut.as_ref(),
+            ),
         ];
 
         Ok(CardInfo {
@@ -339,50 +350,53 @@ pub fn read_card_info(ident: &str) -> Result<CardInfo> {
             sig_counter,
             keys,
         })
-    })
+    });
+    let elapsed_ms: u64 = t_start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    debug!(elapsed_ms, ok = result.is_ok(), "read_card_info complete");
+    result
 }
 
-fn key_info(txn: &mut Card<Transaction<'_>>, usage: KeyUsage) -> Result<KeyInfo> {
-    let key_type = usage.key_type();
-    let fingerprint = txn.fingerprint(key_type)?.map(|fp| format!("{fp:X}"));
-    let created = txn.key_generation_times().ok().and_then(|kgt| {
-        match usage {
-            KeyUsage::Signing => kgt.signature(),
-            KeyUsage::Decryption => kgt.decryption(),
-            KeyUsage::Authentication => kgt.authentication(),
+fn build_key_info(
+    txn: &mut Card<Transaction<'_>>,
+    usage: KeyUsage,
+    fingerprints: Option<&KeySet<Fingerprint>>,
+    gen_times: Option<&KeySet<KeyGenerationTime>>,
+    algorithm: Option<&AlgorithmAttributes>,
+) -> KeyInfo {
+    let fingerprint = fingerprints
+        .and_then(|s| usage.pick_from_key_set(s))
+        .map(format_fingerprint);
+
+    let created = gen_times
+        .and_then(|s| usage.pick_from_key_set(s))
+        .map(KeyGenerationTime::get);
+
+    let algorithm = algorithm.map(ToString::to_string);
+
+    let keygrip = match txn.public_key_material(usage.key_type()).ok() {
+        Some(PublicKeyMaterial::R(rsa)) => {
+            Some(keygrip::format_hex(&keygrip::rsa_keygrip(rsa.n())))
         }
-        .map(u32::from)
-    });
+        _ => None,
+    };
 
-    let algorithm = txn
-        .algorithm_attributes(key_type)
-        .ok()
-        .map(|a| a.to_string());
-
-    let keygrip = txn
-        .public_key(key_type)
-        .ok()
-        .flatten()
-        .and_then(|pk| compute_keygrip(&pk));
-
-    Ok(KeyInfo {
+    KeyInfo {
         usage,
         keygrip,
         fingerprint,
         created,
         algorithm,
-    })
+    }
 }
 
-fn compute_keygrip(pk: &openpgp_card_sequoia::PublicKey) -> Option<String> {
-    use sequoia_openpgp::crypto::mpi::PublicKey;
-    match pk.mpis() {
-        PublicKey::RSA { n, .. } => {
-            let grip = keygrip::rsa_keygrip(n.value());
-            Some(keygrip::format_hex(&grip))
-        }
-        _ => None,
-    }
+fn format_fingerprint(fp: &Fingerprint) -> String {
+    fp.as_bytes()
+        .iter()
+        .fold(String::with_capacity(40), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02X}");
+            acc
+        })
 }
 
 fn manufacturer_name(id: u16) -> String {
@@ -399,28 +413,33 @@ fn manufacturer_name(id: u16) -> String {
 /// `gpg-agent` places in `SETDATA`). The card wraps it in PKCS#1 padding
 /// internally and returns the raw signature bytes.
 ///
-/// Uses `openpgp-card` directly rather than the Sequoia wrapper because
-/// the wrapper's `Signer` insists on rebuilding a `DigestInfo` from a raw
-/// hash — we already have the exact bytes `gpg-agent` wants the card to
-/// sign.
+/// Uses `openpgp-card`'s low-level `ocard::Transaction` (reached via
+/// `Card<Transaction>::card()`) rather than any high-level wrapper — the
+/// wrappers rebuild a `DigestInfo` from a raw hash, and we already have
+/// the exact bytes `gpg-agent` wants signed.
 #[instrument(level = "debug", skip(pin, digest_info), fields(ident, pin_len = pin.len(), di_len = digest_info.len()))]
 pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<Vec<u8>> {
     let t_overall = std::time::Instant::now();
-    let result = with_low_level_card(ident, |txn| {
+    let result = with_card_txn(ident, |txn| {
+        let ocard = txn.card();
         let t_verify = std::time::Instant::now();
-        txn.verify_pw1_sign(pin).map_err(|e| {
-            tracing::error!(error = %e, "verify_pw1_sign failed");
-            e
-        })?;
+        ocard
+            .verify_pw1_sign(SecretBox::new(Box::from(pin)))
+            .map_err(|e| {
+                tracing::error!(error = %e, "verify_pw1_sign failed");
+                e
+            })?;
         tracing::debug!(
             verify_ms = t_verify.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             "PIN verified; sending PSO:CDS"
         );
         let t_cds = std::time::Instant::now();
-        let sig = txn.pso_compute_digital_signature(digest_info.to_vec()).map_err(|e| {
-            tracing::error!(error = %e, "pso_compute_digital_signature failed");
-            e
-        })?;
+        let sig = ocard
+            .pso_compute_digital_signature(digest_info.to_vec())
+            .map_err(|e| {
+                tracing::error!(error = %e, "pso_compute_digital_signature failed");
+                e
+            })?;
         tracing::debug!(
             cds_ms = t_cds.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
             sig_len = sig.len(),
@@ -428,7 +447,10 @@ pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<V
         );
         Ok(sig)
     });
-    tracing::info!(total_ms = t_overall.elapsed().as_millis().try_into().unwrap_or(u64::MAX), "sign_digest_info finished");
+    tracing::info!(
+        total_ms = t_overall.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        "sign_digest_info finished"
+    );
     result
 }
 
@@ -439,13 +461,16 @@ pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<V
 /// scdaemon forwards verbatim). The card returns the unpadded plaintext.
 #[instrument(level = "debug", skip(pin, ciphertext), fields(ident, pin_len = pin.len(), ct_len = ciphertext.len()))]
 pub fn decrypt(ident: &str, pin: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    with_low_level_card(ident, |txn| {
-        txn.verify_pw1_user(pin).map_err(|e| {
-            tracing::error!(error = %e, "verify_pw1_user failed");
-            e
-        })?;
+    with_card_txn(ident, |txn| {
+        let ocard = txn.card();
+        ocard
+            .verify_pw1_user(SecretBox::new(Box::from(pin)))
+            .map_err(|e| {
+                tracing::error!(error = %e, "verify_pw1_user failed");
+                e
+            })?;
         debug!("PIN verified; sending PSO:DECIPHER");
-        let plain = txn.pso_decipher(ciphertext.to_vec()).map_err(|e| {
+        let plain = ocard.pso_decipher(ciphertext.to_vec()).map_err(|e| {
             tracing::error!(error = %e, "pso_decipher failed");
             e
         })?;
@@ -454,9 +479,13 @@ pub fn decrypt(ident: &str, pin: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     })
 }
 
-fn with_low_level_card<R, F>(ident: &str, f: F) -> Result<R>
+/// Open a PC/SC context, locate the card matching `ident`, and drive the
+/// supplied closure against the 0.6 `Card<Transaction>` state. Backend,
+/// card, and transaction are dropped before returning so the next caller
+/// sees a clean PC/SC context.
+fn with_card_txn<R, F>(ident: &str, f: F) -> Result<R>
 where
-    F: FnOnce(&mut openpgp_card::Transaction<'_>) -> Result<R>,
+    F: FnOnce(&mut Card<Transaction<'_>>) -> Result<R>,
 {
     let short = short_ident_from_full(ident)?;
     let t_ctx = std::time::Instant::now();
@@ -471,7 +500,7 @@ where
             retryable: true,
         })?;
         let t_open = std::time::Instant::now();
-        let mut card = OcCard::new(backend)?;
+        let mut card = Card::<Open>::new(backend)?;
         let open_ms = t_open.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let mut txn = card.transaction()?;
         let app_id = txn.application_identifier()?;
@@ -479,7 +508,7 @@ where
             tracing::debug!(
                 ctx_ms = enum_ms,
                 open_ms,
-                "card matched, running low-level op"
+                "card matched, running op"
             );
             let out = f(&mut txn);
             drop(txn);
