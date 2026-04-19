@@ -10,6 +10,7 @@ use scd_rs_card::{
 use secrecy::ExposeSecret;
 
 use crate::pinentry::{build_prompt, request_pin};
+use crate::pool_ttl;
 use crate::state::{KnownKeys, Session};
 
 /// Assuan error codes mirrored from gpg-agent / scdaemon.
@@ -148,6 +149,10 @@ async fn serialno(
     if session.current_ident.as_deref() != Some(chosen.as_ref()) {
         session.cached_info = None;
         session.known_keys = KnownKeys::default();
+        // Different card under the reader: the pooled handle is pointing at
+        // the wrong one. Drop it so the next op opens fresh against the
+        // card SERIALNO just resolved.
+        session.card_pool = None;
     }
     session.current_ident = Some(chosen.0);
     Ok(())
@@ -195,7 +200,8 @@ fn ensure_card_info(session: &mut Session) -> Result<&CardInfo, HandlerError> {
 /// keygrip map.
 fn refresh_card_info(session: &mut Session) -> Result<CardInfo, HandlerError> {
     let ident = require_ident(session)?;
-    let info = read_card_info(&ident).map_err(card_err)?;
+    let info = read_card_info(&mut session.card_pool, pool_ttl::configured(), &ident)
+        .map_err(card_err)?;
     session.known_keys = KnownKeys::from_card_info(&info);
     session.cached_info = Some(info.clone());
     Ok(info)
@@ -542,8 +548,12 @@ async fn sign_with_cached_pin(
     digest_info: &[u8],
     prompt: &str,
 ) -> Result<Vec<u8>, HandlerError> {
-    if let Some(cached) = session.cached_pin_bytes() {
-        match sign_digest_info(ident, cached, digest_info) {
+    // Clone the cached PIN so the immutable borrow ends before we hand
+    // `&mut session.card_pool` to sign_digest_info.
+    let cached = session.cached_pin_bytes().map(<[u8]>::to_vec);
+    let pool_ttl = pool_ttl::configured();
+    if let Some(cached) = cached {
+        match sign_digest_info(&mut session.card_pool, pool_ttl, ident, &cached, digest_info) {
             Ok(sig) => {
                 tracing::debug!("PKSIGN served from PIN cache");
                 session.touch_pin();
@@ -561,7 +571,14 @@ async fn sign_with_cached_pin(
         .await
         .map_err(|e| handler_io(&e))?;
     let pin_bytes = pin.expose_secret().clone();
-    let signature = sign_digest_info(ident, &pin_bytes, digest_info).map_err(card_err)?;
+    let signature = sign_digest_info(
+        &mut session.card_pool,
+        pool_ttl,
+        ident,
+        &pin_bytes,
+        digest_info,
+    )
+    .map_err(card_err)?;
     session.cache_pin(pin_bytes);
     Ok(signature)
 }
@@ -601,8 +618,10 @@ async fn decrypt_with_cached_pin(
     ciphertext: &[u8],
     prompt: &str,
 ) -> Result<Vec<u8>, HandlerError> {
-    if let Some(cached) = session.cached_pin_bytes() {
-        match decrypt(ident, cached, ciphertext) {
+    let cached = session.cached_pin_bytes().map(<[u8]>::to_vec);
+    let pool_ttl = pool_ttl::configured();
+    if let Some(cached) = cached {
+        match decrypt(&mut session.card_pool, pool_ttl, ident, &cached, ciphertext) {
             Ok(plain) => {
                 tracing::debug!("PKDECRYPT served from PIN cache");
                 session.touch_pin();
@@ -620,7 +639,14 @@ async fn decrypt_with_cached_pin(
         .await
         .map_err(|e| handler_io(&e))?;
     let pin_bytes = pin.expose_secret().clone();
-    let plaintext = decrypt(ident, &pin_bytes, ciphertext).map_err(card_err)?;
+    let plaintext = decrypt(
+        &mut session.card_pool,
+        pool_ttl,
+        ident,
+        &pin_bytes,
+        ciphertext,
+    )
+    .map_err(card_err)?;
     session.cache_pin(pin_bytes);
     Ok(plaintext)
 }

@@ -14,6 +14,7 @@
 //! response, same story in 0.4 and 0.6).
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use card_backend::CardBackend;
 use card_backend_pcsc::PcscBackend;
@@ -211,6 +212,192 @@ impl From<OcError> for CardError {
 
 pub type Result<T> = std::result::Result<T, CardError>;
 
+/// PIN verification mode for a pooled card operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinMode {
+    /// PW1 mode 81 — signing (PSO:CDS).
+    Signing,
+    /// PW1 mode 82 — decryption / authentication.
+    User,
+}
+
+/// A card handle kept open across operations so back-to-back signs/decrypts
+/// skip the ~500 ms `Card::<Open>::new` (SELECT + ARD) overhead.
+///
+/// Holds `Card<Open>` — the PC/SC connection — but NOT `Card<Transaction>`.
+/// Each operation starts a fresh PC/SC transaction so other clients on a
+/// shared reader can interleave (the `pcsc-shared` guarantee still holds).
+/// What gets reused is the card session the connection owns, which means
+/// OpenPGP-applet selection state (and, when `pw1_cds_valid_once` is false,
+/// PW1 verification state) persists across ops as long as this handle does.
+pub struct PooledCard {
+    card: Card<Open>,
+    ident: String,
+    last_used: Instant,
+    /// PW1 mode 81 currently verified on this handle? Set after a successful
+    /// Signing op; cleared whenever the card state may have changed.
+    pw1_sign_fresh: bool,
+    /// PW1 mode 82 currently verified on this handle?
+    pw1_user_fresh: bool,
+}
+
+// `card: Card<Open>` is deliberately omitted — it carries a backend
+// trait-object that isn't Debug.
+#[allow(clippy::missing_fields_in_debug)]
+impl std::fmt::Debug for PooledCard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PooledCard")
+            .field("ident", &self.ident)
+            .field("last_used", &self.last_used)
+            .field("pw1_sign_fresh", &self.pw1_sign_fresh)
+            .field("pw1_user_fresh", &self.pw1_user_fresh)
+            .finish()
+    }
+}
+
+impl PooledCard {
+    #[must_use]
+    pub fn is_fresh(&self, ttl: Duration) -> bool {
+        self.last_used.elapsed() < ttl
+    }
+
+    #[must_use]
+    pub fn ident(&self) -> &str {
+        &self.ident
+    }
+}
+
+/// Run a card operation, reusing a pooled handle when one is available,
+/// fresh and matching the requested `ident`. Otherwise opens a fresh
+/// PC/SC handle; on success and when `ttl > 0`, stores it in `pool`.
+///
+/// When `pin` is Some, performs the corresponding PW1 verify before
+/// calling `f`. (Skip-verify on already-fresh handles is a follow-up.)
+///
+/// Failures on a pool hit invalidate the pool entry. Retryable errors
+/// (PC/SC communication, card reset, etc.) trigger one retry via the
+/// fresh-open path.
+pub fn with_pooled_card<R, F>(
+    pool: &mut Option<PooledCard>,
+    ttl: Duration,
+    ident: &str,
+    pin: Option<(PinMode, &[u8])>,
+    mut f: F,
+) -> Result<R>
+where
+    F: FnMut(&mut Card<Transaction<'_>>) -> Result<R>,
+{
+    // Reuse path
+    if ttl > Duration::ZERO
+        && matches!(
+            pool.as_ref(),
+            Some(pc) if pc.ident == ident && pc.is_fresh(ttl)
+        )
+    {
+        let mut pc = pool.take().expect("matched above");
+        let result = run_on_handle(&mut pc.card, pin, &mut f);
+        match result {
+            Ok(value) => {
+                pc.last_used = Instant::now();
+                if let Some((mode, _)) = pin {
+                    match mode {
+                        PinMode::Signing => pc.pw1_sign_fresh = true,
+                        PinMode::User => pc.pw1_user_fresh = true,
+                    }
+                }
+                *pool = Some(pc);
+                debug!("pool hit");
+                return Ok(value);
+            }
+            Err(err) if err.is_retryable() => {
+                tracing::info!(error = %err, "pool hit failed retryably; retrying fresh");
+                // drop pc; fall through to fresh path
+            }
+            Err(err) => {
+                // Non-retryable (BadPin, InvalidID, ...). Drop the pool entry
+                // because card state may be tainted (e.g. PW1 counter changed).
+                return Err(err);
+            }
+        }
+    } else if pool.is_some() {
+        // Stale entry (wrong ident or expired): drop it.
+        *pool = None;
+    }
+
+    // Fresh path
+    let mut card = open_card_by_ident(ident)?;
+    let result = run_on_handle(&mut card, pin, &mut f);
+    let value = result?;
+    if ttl > Duration::ZERO {
+        let (sign_fresh, user_fresh) = match pin {
+            Some((PinMode::Signing, _)) => (true, false),
+            Some((PinMode::User, _)) => (false, true),
+            None => (false, false),
+        };
+        *pool = Some(PooledCard {
+            card,
+            ident: ident.to_string(),
+            last_used: Instant::now(),
+            pw1_sign_fresh: sign_fresh,
+            pw1_user_fresh: user_fresh,
+        });
+    }
+    Ok(value)
+}
+
+/// Start a transaction on the given `Card<Open>`, optionally verify a PIN,
+/// run the closure. Transaction is dropped before return.
+fn run_on_handle<R, F>(
+    card: &mut Card<Open>,
+    pin: Option<(PinMode, &[u8])>,
+    f: &mut F,
+) -> Result<R>
+where
+    F: FnMut(&mut Card<Transaction<'_>>) -> Result<R>,
+{
+    let mut txn = card.transaction()?;
+    if let Some((mode, pin_bytes)) = pin {
+        let pin_box = SecretBox::new(Box::from(pin_bytes));
+        match mode {
+            PinMode::Signing => txn.card().verify_pw1_sign(pin_box)?,
+            PinMode::User => txn.card().verify_pw1_user(pin_box)?,
+        }
+    }
+    f(&mut txn)
+}
+
+/// Open a `Card<Open>` matching `ident`. Iterates PC/SC backends; returns
+/// `NotFound` if none match. Error conversion handles `IdentMismatch` and
+/// PC/SC-level failures.
+fn open_card_by_ident(ident: &str) -> Result<Card<Open>> {
+    let short = short_ident_from_full(ident)?;
+    let t_ctx = Instant::now();
+    let backends = PcscBackend::card_backends(None).map_err(|e| CardError::Pcsc {
+        message: e.to_string(),
+        retryable: true,
+    })?;
+    let mut enum_ms: u64 = t_ctx.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+    for backend in backends {
+        let backend: Box<dyn CardBackend + Send + Sync> = backend.map_err(|e| CardError::Pcsc {
+            message: e.to_string(),
+            retryable: true,
+        })?;
+        let t_open = Instant::now();
+        let mut card = Card::<Open>::new(backend)?;
+        let open_ms = t_open.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let aid = {
+            let txn = card.transaction()?;
+            txn.application_identifier()?
+        };
+        if aid.ident().eq_ignore_ascii_case(&short) {
+            tracing::debug!(ctx_ms = enum_ms, open_ms, "card opened fresh");
+            return Ok(card);
+        }
+        enum_ms = enum_ms.saturating_add(open_ms);
+    }
+    Err(CardError::NotFound)
+}
+
 /// Build the scdaemon-style full AID (32 hex chars) from the card's
 /// `ApplicationIdentifier` fields. The `OpenPGP` card application's registered
 /// AID prefix is `D276000124` plus an application byte, a 16-bit BCD version,
@@ -272,10 +459,14 @@ pub fn enumerate_cards() -> Result<Vec<CardIdent>> {
 /// signature counter are one APDU each. Per-slot public-key reads still
 /// cost two APDUs each because `public_key_material` internally re-reads
 /// ARD (the upstream `// FIXME: caching`).
-#[instrument(level = "debug", fields(ident))]
-pub fn read_card_info(ident: &str) -> Result<CardInfo> {
-    let t_start = std::time::Instant::now();
-    let result = with_card_txn(ident, |txn| {
+#[instrument(level = "debug", skip(pool), fields(ident, pool_ttl_s = pool_ttl.as_secs()))]
+pub fn read_card_info(
+    pool: &mut Option<PooledCard>,
+    pool_ttl: Duration,
+    ident: &str,
+) -> Result<CardInfo> {
+    let t_start = Instant::now();
+    let result = with_pooled_card(pool, pool_ttl, ident, None, |txn| {
         let app_id = txn.application_identifier()?;
         let pws = txn.pw_status_bytes()?;
         let fingerprints = txn.fingerprints().ok();
@@ -417,38 +608,44 @@ fn manufacturer_name(id: u16) -> String {
 /// `Card<Transaction>::card()`) rather than any high-level wrapper — the
 /// wrappers rebuild a `DigestInfo` from a raw hash, and we already have
 /// the exact bytes `gpg-agent` wants signed.
-#[instrument(level = "debug", skip(pin, digest_info), fields(ident, pin_len = pin.len(), di_len = digest_info.len()))]
-pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<Vec<u8>> {
-    let t_overall = std::time::Instant::now();
-    let result = with_card_txn(ident, |txn| {
-        let ocard = txn.card();
-        let t_verify = std::time::Instant::now();
-        ocard
-            .verify_pw1_sign(SecretBox::new(Box::from(pin)))
-            .map_err(|e| {
-                tracing::error!(error = %e, "verify_pw1_sign failed");
-                e
-            })?;
-        tracing::debug!(
-            verify_ms = t_verify.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            "PIN verified; sending PSO:CDS"
-        );
-        let t_cds = std::time::Instant::now();
-        let sig = ocard
-            .pso_compute_digital_signature(digest_info.to_vec())
-            .map_err(|e| {
-                tracing::error!(error = %e, "pso_compute_digital_signature failed");
-                e
-            })?;
-        tracing::debug!(
-            cds_ms = t_cds.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-            sig_len = sig.len(),
-            "signature returned"
-        );
-        Ok(sig)
-    });
+#[instrument(
+    level = "debug",
+    skip(pool, pin, digest_info),
+    fields(ident, pool_ttl_s = pool_ttl.as_secs(), pin_len = pin.len(), di_len = digest_info.len())
+)]
+pub fn sign_digest_info(
+    pool: &mut Option<PooledCard>,
+    pool_ttl: Duration,
+    ident: &str,
+    pin: &[u8],
+    digest_info: &[u8],
+) -> Result<Vec<u8>> {
+    let t_overall = Instant::now();
+    let result = with_pooled_card(
+        pool,
+        pool_ttl,
+        ident,
+        Some((PinMode::Signing, pin)),
+        |txn| {
+            let t_cds = Instant::now();
+            let sig = txn
+                .card()
+                .pso_compute_digital_signature(digest_info.to_vec())
+                .map_err(|e| {
+                    tracing::error!(error = %e, "pso_compute_digital_signature failed");
+                    e
+                })?;
+            tracing::debug!(
+                cds_ms = t_cds.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                sig_len = sig.len(),
+                "signature returned"
+            );
+            Ok(sig)
+        },
+    );
     tracing::info!(
         total_ms = t_overall.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        ok = result.is_ok(),
         "sign_digest_info finished"
     );
     result
@@ -459,63 +656,25 @@ pub fn sign_digest_info(ident: &str, pin: &[u8], digest_info: &[u8]) -> Result<V
 /// `ciphertext` is the payload `gpg-agent` placed in `SETDATA` (for RSA:
 /// the raw padded block, optionally preceded by a 1-byte algo hint that
 /// scdaemon forwards verbatim). The card returns the unpadded plaintext.
-#[instrument(level = "debug", skip(pin, ciphertext), fields(ident, pin_len = pin.len(), ct_len = ciphertext.len()))]
-pub fn decrypt(ident: &str, pin: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    with_card_txn(ident, |txn| {
-        let ocard = txn.card();
-        ocard
-            .verify_pw1_user(SecretBox::new(Box::from(pin)))
-            .map_err(|e| {
-                tracing::error!(error = %e, "verify_pw1_user failed");
-                e
-            })?;
+#[instrument(
+    level = "debug",
+    skip(pool, pin, ciphertext),
+    fields(ident, pool_ttl_s = pool_ttl.as_secs(), pin_len = pin.len(), ct_len = ciphertext.len())
+)]
+pub fn decrypt(
+    pool: &mut Option<PooledCard>,
+    pool_ttl: Duration,
+    ident: &str,
+    pin: &[u8],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    with_pooled_card(pool, pool_ttl, ident, Some((PinMode::User, pin)), |txn| {
         debug!("PIN verified; sending PSO:DECIPHER");
-        let plain = ocard.pso_decipher(ciphertext.to_vec()).map_err(|e| {
+        let plain = txn.card().pso_decipher(ciphertext.to_vec()).map_err(|e| {
             tracing::error!(error = %e, "pso_decipher failed");
             e
         })?;
         debug!(plain_len = plain.len(), "plaintext returned");
         Ok(plain)
     })
-}
-
-/// Open a PC/SC context, locate the card matching `ident`, and drive the
-/// supplied closure against the 0.6 `Card<Transaction>` state. Backend,
-/// card, and transaction are dropped before returning so the next caller
-/// sees a clean PC/SC context.
-fn with_card_txn<R, F>(ident: &str, f: F) -> Result<R>
-where
-    F: FnOnce(&mut Card<Transaction<'_>>) -> Result<R>,
-{
-    let short = short_ident_from_full(ident)?;
-    let t_ctx = std::time::Instant::now();
-    let backends = PcscBackend::card_backends(None).map_err(|e| CardError::Pcsc {
-        message: e.to_string(),
-        retryable: true,
-    })?;
-    let mut enum_ms: u64 = t_ctx.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-    for backend in backends {
-        let backend: Box<dyn CardBackend + Send + Sync> = backend.map_err(|e| CardError::Pcsc {
-            message: e.to_string(),
-            retryable: true,
-        })?;
-        let t_open = std::time::Instant::now();
-        let mut card = Card::<Open>::new(backend)?;
-        let open_ms = t_open.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        let mut txn = card.transaction()?;
-        let app_id = txn.application_identifier()?;
-        if app_id.ident().eq_ignore_ascii_case(&short) {
-            tracing::debug!(
-                ctx_ms = enum_ms,
-                open_ms,
-                "card matched, running op"
-            );
-            let out = f(&mut txn);
-            drop(txn);
-            drop(card);
-            return out;
-        }
-        enum_ms = enum_ms.saturating_add(open_ms);
-    }
-    Err(CardError::NotFound)
 }

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use scd_rs_assuan::{serve_stdio_with_trace, AssuanServer, TraceSink};
-use scd_rs_bin::{pin_ttl, ScdHandler};
+use scd_rs_bin::{pin_ttl, pool_ttl, ScdHandler};
 
 #[derive(Parser, Debug)]
 #[command(name = "scd-rs", about = "Sequoia-backed scdaemon replacement")]
@@ -62,9 +62,10 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var_os("SCD_RS_LOG").map(PathBuf::from));
     init_tracing(log_file.as_deref(), cli.debug.is_some())?;
     let trace = open_trace(cli.trace_file.as_deref())?;
-    // Resolve PIN TTL eagerly so the configured value shows up in the log at
-    // startup rather than only on first PIN cache hit.
+    // Resolve PIN + pool TTLs eagerly so the configured values show up in the
+    // startup log rather than on first use.
     let _ = pin_ttl::configured();
+    let _ = pool_ttl::configured();
     let _ = (cli.server, cli.multi_server, cli.homedir, cli.daemon);
 
     if let Some(path) = cli.socket {

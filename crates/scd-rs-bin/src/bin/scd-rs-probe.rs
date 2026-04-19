@@ -9,6 +9,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use scd_rs_bin::pool_ttl;
 use scd_rs_card::{enumerate_cards, read_card_info, CardError, CardInfo, KeyInfo};
 use tracing::{error, info, warn};
 
@@ -82,7 +83,9 @@ fn run_serial() -> ExitCode {
 }
 
 fn run_info(ident: &str) -> ExitCode {
-    match read_card_info(ident) {
+    // One-shot tool: no pool. Pass Duration::ZERO to force the fresh path.
+    let mut pool = None;
+    match read_card_info(&mut pool, Duration::ZERO, ident) {
         Ok(info) => {
             print_info(&info);
             ExitCode::SUCCESS
@@ -99,6 +102,11 @@ fn run_loop(ident: &str, count: u32, delay_ms: u64) -> ExitCode {
     let mut failures = 0u32;
     let start = Instant::now();
 
+    // Share a single pool across iterations so `SCD_RS_CARD_POOL_TTL` has the
+    // same effect here as in the daemon.
+    let pool_ttl = pool_ttl::configured();
+    let mut pool = None;
+
     for i in 1..=count {
         let step = if i.is_multiple_of(2) { "info" } else { "serial" };
         let result = if step == "serial" {
@@ -110,7 +118,7 @@ fn run_loop(ident: &str, count: u32, delay_ms: u64) -> ExitCode {
                 }
             })
         } else {
-            read_card_info(ident).map(|_| ())
+            read_card_info(&mut pool, pool_ttl, ident).map(|_| ())
         };
 
         match result {

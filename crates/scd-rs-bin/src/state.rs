@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use scd_rs_card::{CardIdent, CardInfo, KeyUsage};
+use scd_rs_card::{CardIdent, CardInfo, KeyUsage, PooledCard};
 use secrecy::{ExposeSecret, SecretBox};
 
 use crate::pin_ttl;
@@ -127,6 +127,10 @@ pub struct Session {
     /// re-reading the card (each `read_card_info` costs ~3 seconds of
     /// round-trips). Refreshed explicitly on SERIALNO and LEARN --force.
     pub cached_info: Option<CardInfo>,
+    /// Optional warm card handle kept across operations when
+    /// `SCD_RS_CARD_POOL_TTL` is set. `None` = pooling disabled (every
+    /// card op opens a fresh PC/SC handle).
+    pub card_pool: Option<PooledCard>,
 }
 
 impl Session {
