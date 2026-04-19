@@ -114,13 +114,19 @@ other keys, so our daemon must return them rather than raising a fatal state.
 
 `RESTART` at end of each logical workflow. The daemon must:
 
-1. Clear per-session state (SETDATA buffer, cached PIN if any).
+1. Clear the per-flow `SETDATA` buffer.
 2. Keep the Unix socket connection open.
 3. Reply `OK`.
 4. Accept further commands on the same connection.
 
-No card disconnect is required on `RESTART` — that's a per-operation concern
-owned by `scd-rs-card::with_card`, independent of the Assuan session.
+Card identity, cached `CardInfo`, keygrip map, the PIN cache, and the
+optional pooled card handle all **survive** `RESTART`; gpg-agent treats
+`RESTART` as a flow boundary, not a session end, so re-reading all of
+that state would add several seconds of round-trips to every sign.
+
+No PC/SC disconnect is required on `RESTART`; card access is per-
+operation inside `scd-rs-card::with_pooled_card`, independent of the
+Assuan session.
 
 ## Commands observed but NOT required
 

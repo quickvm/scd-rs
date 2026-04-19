@@ -3,9 +3,6 @@ FROM docker.io/library/rust:1.94-slim-bookworm
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         pkg-config \
-        clang \
-        libclang-dev \
-        libnettle-dev \
         libpcsclite-dev \
     && rm -rf /var/lib/apt/lists/*
 
