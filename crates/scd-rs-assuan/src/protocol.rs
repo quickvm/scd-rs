@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn parses_empty_data_line() {
-        assert_eq!(parse_client_line(b"D\n").unwrap(), ClientLine::Data(Vec::new()));
+        assert_eq!(
+            parse_client_line(b"D\n").unwrap(),
+            ClientLine::Data(Vec::new())
+        );
     }
 
     #[test]

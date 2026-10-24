@@ -147,10 +147,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_escape() {
-        assert_eq!(
-            decode_data(b"abc%1"),
-            Err(FrameError::TruncatedEscape)
-        );
+        assert_eq!(decode_data(b"abc%1"), Err(FrameError::TruncatedEscape));
     }
 
     #[test]
@@ -166,7 +163,7 @@ mod tests {
         // All raw bytes that do NOT need escaping.
         let input = vec![b'x'; 5_000];
         let lines = encode_data_lines(&input);
-        assert!(!lines.is_empty());
+        assert_ne!(lines, Vec::<Vec<u8>>::new());
         for line in &lines {
             assert!(line.starts_with(b"D "));
             // Each emitted line plus trailing newline must be ≤ MAX_LINE_LEN.
@@ -192,7 +189,7 @@ mod tests {
 
     #[test]
     fn encode_data_lines_empty_input_emits_no_lines() {
-        assert!(encode_data_lines(&[]).is_empty());
+        assert_eq!(encode_data_lines(&[]), Vec::<Vec<u8>>::new());
     }
 
     proptest! {
