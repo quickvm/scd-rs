@@ -426,8 +426,7 @@ where
     let value = f(&mut txn)?;
     let valid_once = txn
         .pw_status_bytes()
-        .map(|p| p.pw1_cds_valid_once())
-        .unwrap_or(true);
+        .map_or(true, |p| p.pw1_cds_valid_once());
     Ok((value, valid_once))
 }
 
