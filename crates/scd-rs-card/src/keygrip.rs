@@ -58,7 +58,10 @@ mod tests {
 
     #[test]
     fn strips_leading_zeros() {
-        assert_eq!(strip_leading_zeros(&[0x00, 0x00, 0xAB, 0xCD]), &[0xAB, 0xCD]);
+        assert_eq!(
+            strip_leading_zeros(&[0x00, 0x00, 0xAB, 0xCD]),
+            &[0xAB, 0xCD]
+        );
         assert_eq!(strip_leading_zeros(&[0xAB, 0xCD]), &[0xAB, 0xCD]);
         assert_eq!(strip_leading_zeros(&[0x00]), &[] as &[u8]);
     }
@@ -74,7 +77,10 @@ mod tests {
         // High bit of 0x01 is clear → no leading zero prepended.
         // SHA-1(01020304) = 12DADA1FFF4D4787ADE3333147202C3B443E376F
         let grip = rsa_keygrip(&[0x01u8, 0x02, 0x03, 0x04]);
-        assert_eq!(format_hex(&grip), "12DADA1FFF4D4787ADE3333147202C3B443E376F");
+        assert_eq!(
+            format_hex(&grip),
+            "12DADA1FFF4D4787ADE3333147202C3B443E376F"
+        );
     }
 
     #[test]
@@ -82,6 +88,9 @@ mod tests {
         // High bit of 0xFF is set → libgcrypt would prepend 0x00 for sign.
         // SHA-1(00FF) = AA3E5DCDD77B153F2E59BD0D8794FDE33CB4E486
         let grip = rsa_keygrip(&[0xFFu8]);
-        assert_eq!(format_hex(&grip), "AA3E5DCDD77B153F2E59BD0D8794FDE33CB4E486");
+        assert_eq!(
+            format_hex(&grip),
+            "AA3E5DCDD77B153F2E59BD0D8794FDE33CB4E486"
+        );
     }
 }

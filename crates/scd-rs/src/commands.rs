@@ -333,7 +333,12 @@ fn locate_keygrip(
 
 async fn emit_learn_status(conn: &mut Connection, info: &CardInfo) -> Result<(), HandlerError> {
     // Matches the order and shape of the Phase 0 LEARN --force trace.
-    status(conn, "READER", &format!("{} card reader", info.manufacturer_name)).await?;
+    status(
+        conn,
+        "READER",
+        &format!("{} card reader", info.manufacturer_name),
+    )
+    .await?;
     status(conn, "SERIALNO", info.ident.as_ref()).await?;
     status(conn, "APPTYPE", "openpgp").await?;
     status(conn, "APPVERSION", &format!("{:X}", info.app_version_bcd)).await?;
@@ -385,7 +390,9 @@ async fn emit_learn_status(conn: &mut Connection, info: &CardInfo) -> Result<(),
 }
 
 async fn status(conn: &mut Connection, keyword: &str, data: &str) -> Result<(), HandlerError> {
-    conn.write_status(keyword, data).await.map_err(|e| handler_io(&e))
+    conn.write_status(keyword, data)
+        .await
+        .map_err(|e| handler_io(&e))
 }
 
 fn keypairinfo_payload(key: &KeyInfo) -> String {
@@ -393,10 +400,10 @@ fn keypairinfo_payload(key: &KeyInfo) -> String {
     let slot = key.usage.openpgp_slot();
     let usage = key.usage.scd_usage();
     let created = key.created.unwrap_or(0);
-    let algo = key.algorithm.as_deref().map_or_else(
-        || "unknown".into(),
-        algo_to_scd_token,
-    );
+    let algo = key
+        .algorithm
+        .as_deref()
+        .map_or_else(|| "unknown".into(), algo_to_scd_token);
     format!("{grip} OPENPGP.{slot} {usage} {created} {algo}")
 }
 
@@ -523,10 +530,10 @@ async fn getattr(
     match args {
         "KEY-ATTR" => {
             for (idx, key) in info.keys.iter().enumerate() {
-                let algo = key.algorithm.as_deref().map_or_else(
-                    || "unknown".into(),
-                    algo_to_scd_token,
-                );
+                let algo = key
+                    .algorithm
+                    .as_deref()
+                    .map_or_else(|| "unknown".into(), algo_to_scd_token);
                 // For RSA the scdaemon format is `<slot> 1 rsa<bits> <e_bits> 1`.
                 status(conn, "KEY-ATTR", &format!("{} 1 {algo} 32 1", idx + 1)).await?;
             }
@@ -615,7 +622,8 @@ fn setdata(session: &mut Session, args: &str) -> Result<(), HandlerError> {
         Some(rest) => (true, rest.trim()),
         None => (false, args.trim()),
     };
-    let parse = |s: &str| hex::decode(s).map_err(|e| HandlerError::new(err::INV_ARG, e.to_string()));
+    let parse =
+        |s: &str| hex::decode(s).map_err(|e| HandlerError::new(err::INV_ARG, e.to_string()));
     if append {
         session.setdata.append(&mut parse(hex_body)?);
     } else {
@@ -669,7 +677,13 @@ async fn sign_with_cached_pin(
     let cached = session.cached_pin_bytes().map(<[u8]>::to_vec);
     let pool_ttl = pool_ttl::configured();
     if let Some(cached) = cached {
-        match sign_digest_info(&mut session.card_pool, pool_ttl, ident, &cached, digest_info) {
+        match sign_digest_info(
+            &mut session.card_pool,
+            pool_ttl,
+            ident,
+            &cached,
+            digest_info,
+        ) {
             Ok(sig) => {
                 tracing::debug!("PKSIGN served from PIN cache");
                 session.touch_pin();
