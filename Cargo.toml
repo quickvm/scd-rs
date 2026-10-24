@@ -17,7 +17,7 @@ authors = ["QuickVM, LLC <hello@quickvm.com>"]
 [workspace.dependencies]
 card-backend = "0.2"
 card-backend-pcsc = "0.5.1"
-openpgp-card = "0.6.1"
+openpgp-card = "0.7.0"
 sha1 = "0.11"
 tokio = { version = "1.52", features = ["net", "io-std", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"

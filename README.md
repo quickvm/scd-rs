@@ -190,7 +190,7 @@ Three crates:
 
 ```
 crates/
-├── scd-rs-card       OpenPGP card layer (openpgp-card 0.6, PC/SC via card-backend-pcsc)
+├── scd-rs-card       OpenPGP card layer (openpgp-card 0.7, PC/SC via card-backend-pcsc)
 ├── scd-rs-assuan     Assuan protocol server (hand-rolled; no maintained Rust Assuan crate)
 └── scd-rs            Daemon + probe binaries
     ├── bin/scd-rs         the daemon gpg-agent talks to
@@ -340,6 +340,6 @@ MIT. See [LICENSE](LICENSE).
 ## Related
 
 - [`openpgp-card`](https://codeberg.org/openpgp-card/openpgp-card):
-  the underlying card-access library. scd-rs uses 0.6.
+  the underlying card-access library. scd-rs uses 0.7.
 - GnuPG's [`scdaemon`](https://www.gnupg.org/documentation/manuals/gnupg/Smart-Card-Daemon.html):
   the C implementation this replaces for a narrow set of workflows.
