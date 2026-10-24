@@ -43,8 +43,9 @@ All three canonical workflows (`gpg --card-status`, `gpg --clearsign`,
 trace diff (see `docs/assuan-traces/`) with zero load-bearing differences.
 
 **Supported hardware:** Nitrokey 3 (primary test device) and YubiKey
-4/5. Unknown vendor IDs render as raw hex; no speculative support for
-other vendors.
+4/5, one at a time or several plugged in at once (see
+[Multiple cards](#multiple-cards)). Unknown vendor IDs render as raw
+hex; no speculative support for other vendors.
 
 **Key/algorithm support:** RSA-4096 is the primary tested path (the
 author's card). ECC paths are wired but not hardware-validated.
@@ -150,7 +151,7 @@ of it drops out.
 The PIN cache is per Assuan connection (i.e. per gpg-agent ↔ scd-rs
 session, usually lifetime of gpg-agent). PIN bytes are wrapped in
 `secrecy::SecretBox` while stored, and cleared on any `BadPin` response
-from the card.
+from the card and whenever the session moves to another card.
 
 ### Card-handle pool
 
@@ -164,7 +165,9 @@ Invalidation:
 - PC/SC / card-reset errors → pool dropped, op retried once on a fresh
   handle.
 - `BadPin` or `InvalidID` → pool dropped, error propagated.
-- `SERIALNO` resolving a different card → pool dropped.
+- Session moving to a different card (see
+  [Multiple cards](#multiple-cards)) → pool dropped, along with the PIN
+  cache.
 - `RESTART` (gpg-agent flow boundary) → pool **preserved** by design.
 
 The pool's `skip_verify` optimization only activates when the card
@@ -183,6 +186,39 @@ The remaining 2.0 s is upstream-gated: ~0.5 s is `Card<Transaction>::new`
 re-reading ARD (an upstream `// FIXME: caching` in
 `openpgp-card::ocard::keys::public_key`), and ~1.6 s is the card silicon
 doing the actual RSA-4096 modular exponentiation.
+
+## Multiple cards
+
+scd-rs works with several OpenPGP cards plugged in at once, whatever
+order PC/SC lists them in. Each gpg-agent session is bound to one card
+at a time:
+
+- **A keygrip finds its card.** `KEYINFO <keygrip>`, `PKSIGN` and
+  `PKDECRYPT` use the card that holds the key and bind the session to
+  it, so signing with a key on the second card PC/SC lists works.
+- **`SERIALNO --demand=<AID>`** binds that card. If it is not plugged
+  in, scd-rs answers `ERR 100696144 No such device`, as stock scdaemon
+  does, and keeps the card it had. AIDs match without their two version
+  bytes, as in stock, which reports a YubiKey's AID with version
+  `0000`.
+- **Bare `SERIALNO` and `SERIALNO --all`** answer with the bound card,
+  from memory, in a single `S SERIALNO` line (gpg-agent rejects a
+  second one). A session with no card yet binds the first card PC/SC
+  lists. Stock scdaemon 2.4.9 picks the last one, so with two cards in
+  a fresh session `gpg --card-status` can show a different card than
+  stock until a key operation binds one.
+- **Listing.** `KEYINFO --list` covers every card, bound card first.
+  `GETINFO card_list` enumerates and prints one `S SERIALNO` per card in
+  reader order, which is what `gpg --card-status all` walks.
+- **Switching cards** drops the PIN cache and the pooled handle. Both
+  belong to the old card, and sending its PIN to the new card would cost
+  one of the new card's PIN retries.
+
+Each card's keys are read once per session (about 0.1 s for a YubiKey,
+3.5 s for a Nitrokey 3 with three RSA-4096 keys) and served from memory
+after that. When no card the session knows holds a keygrip, `KEYINFO`
+re-enumerates, since gpg-agent asks it while waiting for you to insert
+a card; `PKSIGN` and `PKDECRYPT` only read cards not read yet.
 
 ## Architecture
 
@@ -214,16 +250,20 @@ There is exactly one place in the crate that calls `Card::<Open>::new`
 
 `scd_rs::state::Session` carries all per-connection state:
 
-- `current_ident`: last resolved card AID
-- `cached_info`: `CardInfo` snapshot (populated lazily, survives RESTART)
-- `known_keys`: keygrip to usage map derived from `cached_info`
+- `current_ident`: AID of the card the session is bound to
+- `cards`: every card seen this session, with a `CardInfo` snapshot of
+  each one read so far (populated lazily, survives RESTART)
 - `setdata`: buffered payload from `SETDATA` / `SETDATA --append`
-- `cached_pin`: sliding-window PIN cache
-- `card_pool`: optional `PooledCard` when pooling is enabled
+- `cached_pin`: sliding-window PIN cache for the bound card
+- `card_pool`: optional `PooledCard` for the bound card when pooling is
+  enabled
 
-`RESTART` clears only `setdata`. Card identity, keygrip map, `CardInfo`,
-PIN, and pool all survive, matching gpg-agent's expectation that
-`RESTART` is a per-flow boundary, not a session termination.
+The choice of card (by AID, by keygrip, or by default) lives in pure
+functions in `scd_rs::cards`, unit-tested without hardware.
+
+`RESTART` clears only `setdata`. Card identity, card snapshots, PIN,
+and pool all survive, matching gpg-agent's expectation that `RESTART`
+is a per-flow boundary, not a session termination.
 
 ## Development
 

@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# Fake card handles for other crates' unit tests; see src/test_support.rs.
+test-support = []
+
 [dependencies]
 card-backend = { workspace = true }
 card-backend-pcsc = { workspace = true }

@@ -28,5 +28,8 @@ clap = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+scd-rs-card = { path = "../scd-rs-card", features = ["test-support"] }
+
 [lints]
 workspace = true
