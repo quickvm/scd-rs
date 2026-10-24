@@ -122,7 +122,9 @@ fn init_tracing(log_file: Option<&std::path::Path>, verbose: bool) -> Result<()>
             "info,scd_rs_card=debug"
         })
     });
-    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     if let Some(path) = log_file {
         let file = std::fs::OpenOptions::new()
             .create(true)

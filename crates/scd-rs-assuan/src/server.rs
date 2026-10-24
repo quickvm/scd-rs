@@ -112,10 +112,7 @@ impl Connection {
     /// server mode where `gpg-agent` spawns us and talks over pipes.
     #[must_use]
     pub fn from_stdio() -> Self {
-        Self::new(
-            Box::new(tokio::io::stdin()),
-            Box::new(tokio::io::stdout()),
-        )
+        Self::new(Box::new(tokio::io::stdin()), Box::new(tokio::io::stdout()))
     }
 
     /// Tee every line read from and written to this connection into `sink`.
@@ -196,11 +193,7 @@ impl Connection {
     ///
     /// The caller is responsible for zeroising the returned bytes if they
     /// contain secret material (e.g. a PIN).
-    pub async fn inquire(
-        &mut self,
-        keyword: &str,
-        args: &str,
-    ) -> Result<Vec<u8>, ServerError> {
+    pub async fn inquire(&mut self, keyword: &str, args: &str) -> Result<Vec<u8>, ServerError> {
         // NEEDPIN/PASSPHRASE/PIN prompts carry the card's serial and holder
         // in the prompt, and the client's D/END response carries the PIN
         // itself. Redact in the trace file for the duration of the inquire
@@ -215,13 +208,10 @@ impl Connection {
         result
     }
 
-    async fn inquire_inner(
-        &mut self,
-        keyword: &str,
-        args: &str,
-    ) -> Result<Vec<u8>, ServerError> {
+    async fn inquire_inner(&mut self, keyword: &str, args: &str) -> Result<Vec<u8>, ServerError> {
         if args.is_empty() {
-            self.write_line(format!("INQUIRE {keyword}\n").as_bytes()).await?;
+            self.write_line(format!("INQUIRE {keyword}\n").as_bytes())
+                .await?;
         } else {
             self.write_line(format!("INQUIRE {keyword} {args}\n").as_bytes())
                 .await?;

@@ -53,7 +53,7 @@ mod tests {
         assert_eq!(parse("30s").unwrap(), Duration::from_secs(30));
         assert_eq!(parse("10m").unwrap(), Duration::from_secs(600));
         assert_eq!(parse("1h").unwrap(), Duration::from_secs(3600));
-        assert_eq!(parse("2d").unwrap(), Duration::from_secs(172_800));
+        assert_eq!(parse("2d").unwrap(), Duration::from_hours(48));
     }
 
     #[test]

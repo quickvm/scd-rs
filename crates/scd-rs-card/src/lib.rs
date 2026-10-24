@@ -344,7 +344,10 @@ where
                     }
                 }
                 *pool = Some(pc);
-                debug!(skipped_verify = can_skip_verify && pin.is_some(), "pool hit");
+                debug!(
+                    skipped_verify = can_skip_verify && pin.is_some(),
+                    "pool hit"
+                );
                 return Ok(value);
             }
             Err(err) if err.is_retryable() => {
@@ -385,11 +388,7 @@ where
 
 /// Start a transaction on the given `Card<Open>`, optionally verify a PIN,
 /// run the closure. Transaction is dropped before return.
-fn run_on_handle<R, F>(
-    card: &mut Card<Open>,
-    pin: Option<(PinMode, &[u8])>,
-    f: &mut F,
-) -> Result<R>
+fn run_on_handle<R, F>(card: &mut Card<Open>, pin: Option<(PinMode, &[u8])>, f: &mut F) -> Result<R>
 where
     F: FnMut(&mut Card<Transaction<'_>>) -> Result<R>,
 {
@@ -427,8 +426,7 @@ where
     let value = f(&mut txn)?;
     let valid_once = txn
         .pw_status_bytes()
-        .map(|p| p.pw1_cds_valid_once())
-        .unwrap_or(true);
+        .map_or(true, |p| p.pw1_cds_valid_once());
     Ok((value, valid_once))
 }
 
@@ -710,7 +708,11 @@ pub fn sign_digest_info(
         },
     );
     tracing::info!(
-        total_ms = t_overall.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        total_ms = t_overall
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
         ok = result.is_ok(),
         "sign_digest_info finished"
     );
