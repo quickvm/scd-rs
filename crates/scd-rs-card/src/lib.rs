@@ -29,6 +29,8 @@ use thiserror::Error;
 use tracing::{debug, instrument};
 
 mod keygrip;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use keygrip::{format_hex, rsa_keygrip};
 
