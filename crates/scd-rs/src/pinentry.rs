@@ -22,10 +22,7 @@ pub async fn request_pin(
     prompt: &str,
 ) -> Result<SecretBox<Vec<u8>>, ServerError> {
     let mut bytes = conn.inquire("NEEDPIN", prompt).await?;
-    let real_len = bytes
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(bytes.len());
+    let real_len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     bytes.truncate(real_len);
     let pin = SecretBox::new(Box::new(bytes.clone()));
     bytes.zeroize();

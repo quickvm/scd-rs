@@ -112,7 +112,11 @@ fn run_loop(ident: &str, count: u32, delay_ms: u64) -> ExitCode {
     let mut pool = None;
 
     for i in 1..=count {
-        let step = if i.is_multiple_of(2) { "info" } else { "serial" };
+        let step = if i.is_multiple_of(2) {
+            "info"
+        } else {
+            "serial"
+        };
         let result = if step == "serial" {
             enumerate_cards().and_then(|ids| {
                 if ids.iter().any(|id| id.as_ref() == ident) {

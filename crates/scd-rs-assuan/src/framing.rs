@@ -147,10 +147,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_truncated_escape() {
-        assert_eq!(
-            decode_data(b"abc%1"),
-            Err(FrameError::TruncatedEscape)
-        );
+        assert_eq!(decode_data(b"abc%1"), Err(FrameError::TruncatedEscape));
     }
 
     #[test]
