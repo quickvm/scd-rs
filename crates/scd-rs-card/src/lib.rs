@@ -5,13 +5,13 @@
 //! drops it before returning. Nothing in this crate is permitted to retain a
 //! card handle across calls.
 //!
-//! Uses the `openpgp-card` 0.6 `Card<Transaction>` state machine. That layer
+//! Uses the `openpgp-card` 0.7 `Card<Transaction>` state machine. That layer
 //! caches a single `ApplicationRelatedData` read for the lifetime of the
 //! transaction, so fingerprints / PW status / algorithm attributes /
 //! key-generation times all come out of one APDU. Per-slot public-key reads
 //! still cost two APDUs each (the upstream `ocard::keys::public_key` has a
 //! standing `FIXME: caching` that re-fetches ARD before parsing the pubkey
-//! response, same story in 0.4 and 0.6).
+//! response, same story in 0.4, 0.6 and 0.7).
 
 use std::fmt;
 use std::time::{Duration, Instant};
