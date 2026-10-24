@@ -296,3 +296,52 @@ scdaemon uses for "keygrip is on the card but the wrong usage for
 this op" (asking the signing key to decrypt). Previously we returned
 the misnamed `INV_ARG` for this case.
 
+
+## Multiple cards
+
+### Route by keygrip, cache a snapshot per card
+
+With a YubiKey and a Nitrokey 3 plugged in and the YubiKey listed first,
+scd-rs bound the session to the YubiKey and answered `KEYINFO` for the
+Nitrokey's signing key with `No secret key`, so every sign failed.
+gpg-agent picks the card by keygrip, not by `SERIALNO`: its sign and
+decrypt flows send `SERIALNO --all`, then `KEYINFO <keygrip>`, then
+`PKSIGN` / `PKDECRYPT <keygrip>`, and ignore the serial in between.
+
+The session now keeps a `CardInfo` snapshot of every card it has read
+(`scd_rs::cards::KnownCards`) and looks keygrips up across all of them.
+The card that answers is bound to the session. Stock scdaemon does not
+rebind on a keygrip, and it keeps a connection and PIN state per card.
+scd-rs has one PIN cache and one pooled handle, and binding keeps them
+pointed at the card in use. Binding another card drops both, since
+a cached PIN tried against the wrong card costs that card a retry.
+
+**Evidence:** stock 2.4.9 traces in both reader orders
+(`docs/assuan-traces/multicard-*`, local) and the 2.4.9 source:
+`scd/app.c` `select_application` (new cards go to the head of the card
+list, `--demand` moves its card there, absent card is `GPG_ERR_ENODEV`)
+and `do_with_keygrip`, `scd/command.c` `cmd_pksign` ("we directly use
+the card, with no change of ctrl->card_ctx").
+
+### `SERIALNO --all` stays one line
+
+`--all` asks stock to select every application on the current card; it
+still reports one card. gpg-agent's `get_serialno_cb` returns
+`GPG_ERR_CONFLICT` on a second `S SERIALNO` line, so listing every card
+there would break every sign. Listing every card is `GETINFO card_list`'s
+job.
+
+### Default card stays the first one PC/SC lists
+
+Stock defaults to the last card PC/SC lists. scd-rs keeps its existing
+rule, the first, along with the fast path that answers `SERIALNO` for a
+bound session from memory. In a fresh session with two cards,
+`gpg --card-status` can therefore show a different card than stock.
+
+### Re-enumerate on a `KEYINFO` miss only
+
+gpg-agent waits for an inserted card by repeating `SERIALNO --all` and
+`KEYINFO <keygrip>`, and `SERIALNO` is served from memory, so a
+`KEYINFO` miss re-enumerates (~1 s with two cards). A `PKSIGN` /
+`PKDECRYPT` miss does not: gpg-agent asks `KEYINFO` before those, and
+its decrypt flow also tries keygrips that are on no card.

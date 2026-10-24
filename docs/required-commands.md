@@ -16,6 +16,8 @@ directions (`<-` from agent, `->` to agent) so it's sufficient.
 | `GETINFO version`                | card-status             | yes (static reply)      |
 | `SERIALNO`                       | card-status, decrypt    | yes                     |
 | `SERIALNO --all`                 | clearsign, decrypt      | yes                     |
+| `SERIALNO --demand=<AID>`        | `gpg --card-status all` | yes (see Multiple cards) |
+| `GETINFO card_list`              | `gpg --card-status all` | yes (see Multiple cards) |
 | `LEARN --force`                  | card-status             | yes (see status lines below) |
 | `KEYINFO --list`                 | card-status, clearsign  | yes                     |
 | `KEYINFO --list=encr`            | decrypt                 | yes                     |
@@ -62,8 +64,8 @@ OK
 ```
 
 `T` = type (token/card-resident key). Usage codes: `sc` (sign+cert),
-`e` (encrypt), `sa` (sign+auth). `--list` emits one line per key; `--list=encr`
-filters to encryption-capable keys.
+`e` (encrypt), `sa` (sign+auth). `--list` emits one line per key on every
+card; `--list=encr` filters to encryption-capable keys.
 
 ## `SETDATA` chunking
 
@@ -105,6 +107,9 @@ Observed codes from our traces:
 
 - `100663313 No secret key <SCD>` — wrong keygrip for PKDECRYPT
 - `100663414 Invalid ID <SCD>` — non-decrypt keygrip used for PKDECRYPT
+- `100663323 Not found <SCD>` — `KEYINFO <keygrip>` for a key on no card
+- `100696144 No such device <SCD>` — `SERIALNO --demand=<AID>` for a card
+  that is not plugged in
 
 The anonymous-recipient retry loop in `gpg --decrypt` drives several of these
 during the traces — `gpg-agent` tolerates them cleanly and continues trying
@@ -127,6 +132,33 @@ that state would add several seconds of round-trips to every sign.
 No PC/SC disconnect is required on `RESTART`; card access is per-
 operation inside `scd-rs-card::with_pooled_card`, independent of the
 Assuan session.
+
+## Multiple cards
+
+Captured on 2026-10-24 against stock scdaemon 2.4.9 with a YubiKey 5 and
+a Nitrokey 3 plugged in, in both reader orders (`docs/assuan-traces/multicard-*`,
+local only), and read against the 2.4.9 source.
+
+gpg-agent's sign and decrypt flows send `SERIALNO --all`, then
+`KEYINFO <keygrip>` (looping on an insert-card prompt while it fails),
+then `PKSIGN` / `PKDECRYPT <keygrip>`. The `SERIALNO` answer does not pick
+the card; the keygrip does.
+
+| Command | Stock scdaemon 2.4.9 | scd-rs |
+|---|---|---|
+| `SERIALNO`, `SERIALNO --all` | One `S SERIALNO` line for its current card: the last one demanded, else the last card PC/SC lists. `--all` selects every app on that card, not every card; gpg-agent fails a reply with a second line (`GPG_ERR_CONFLICT`, `agent/call-scd.c`). | One line for the bound card, from memory. With no card bound yet, the first card PC/SC lists. |
+| `SERIALNO --demand=<AID>` | Selects that card. Absent card: `ERR 100696144 No such device`, current card unchanged. OpenPGP AIDs match without their version bytes (`is_same_serialno`). | Same, binding the session. A demand for the bound card is served from memory. |
+| `GETINFO card_list` | `S SERIALNO` per card it has scanned, sorted by reader slot. Before the first scan: `ERR 100663408 Card not present`. | Enumerates, then `S SERIALNO` per card in reader order. No card: `ERR 100663408`. |
+| `KEYINFO --list[=<usage>]` | Every key on every card, current card first. Empty before the first scan. | Every key on every card, bound card first. |
+| `KEYINFO <keygrip>` | Searches every card, current card unchanged. Not found: `ERR 100663323 Not found`. | Searches every card and binds the one holding the key. Not found: re-enumerates once, then `ERR 100663323`. |
+| `PKSIGN`, `PKDECRYPT <keygrip>` | Uses the card holding the key, current card unchanged. Not found: `ERR 100663313 No secret key`. | Uses the card holding the key, binding it once the usage and `SETDATA` checks pass. Not found: `ERR 100663313`. |
+
+Stock reports a YubiKey's AID as `D27600012401` `0000` `0006…`, built from
+the YubiKey's own serial; scd-rs reports the AID the card returns
+(`…0304…`). Either form works in `--demand`.
+
+scd-rs keeps one PIN cache and one pooled handle per session, so binding a
+different card drops both.
 
 ## Commands observed but NOT required
 

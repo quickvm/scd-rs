@@ -3,52 +3,13 @@
 //! Lives for the lifetime of one Assuan client connection. Does not retain
 //! any PC/SC handles; card access is always fresh via `scd_rs_card`.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use scd_rs_card::{CardIdent, CardInfo, KeyUsage, PooledCard};
+use scd_rs_card::PooledCard;
 use secrecy::{ExposeSecret, SecretBox};
 
+use crate::cards::KnownCards;
 use crate::pin_ttl;
-
-/// Snapshot of the keys learned from a `LEARN --force` / `read_card_info`.
-#[derive(Debug, Clone, Default)]
-pub struct KnownKeys {
-    /// Maps 40-char uppercase keygrip → slot usage.
-    by_grip: HashMap<String, KeyUsage>,
-    /// The ident of the card this snapshot came from.
-    ident: Option<CardIdent>,
-}
-
-impl KnownKeys {
-    #[must_use]
-    pub fn from_card_info(info: &CardInfo) -> Self {
-        let mut by_grip = HashMap::new();
-        for key in &info.keys {
-            if let Some(grip) = &key.keygrip {
-                by_grip.insert(grip.clone(), key.usage);
-            }
-        }
-        Self {
-            by_grip,
-            ident: Some(info.ident.clone()),
-        }
-    }
-
-    #[must_use]
-    pub fn usage(&self, keygrip: &str) -> Option<KeyUsage> {
-        self.by_grip.get(keygrip).copied()
-    }
-
-    pub fn grips(&self) -> impl Iterator<Item = (&String, &KeyUsage)> {
-        self.by_grip.iter()
-    }
-
-    #[must_use]
-    pub fn ident(&self) -> Option<&CardIdent> {
-        self.ident.as_ref()
-    }
-}
 
 /// Which PW1 mode a card operation needs; the daemon uses this only to
 /// dispatch the right verify APDU (`verify_pw1_sign` vs `verify_pw1_user`).
@@ -112,28 +73,44 @@ impl CachedPin {
 /// One Assuan session's worth of state.
 #[derive(Debug, Default)]
 pub struct Session {
-    /// The card this session is currently bound to (from last SERIALNO /
-    /// LEARN), in scdaemon-style full AID form.
+    /// The card this session is bound to, in scdaemon-style full AID form.
+    /// Set by SERIALNO, and by a KEYINFO / PKSIGN / PKDECRYPT keygrip that
+    /// lives on another card; see [`Session::bind_card`].
     pub current_ident: Option<String>,
     /// Data buffered by `SETDATA` / `SETDATA --append`, consumed by the
     /// next `PKSIGN` or `PKDECRYPT`.
     pub setdata: Vec<u8>,
-    /// Keys discovered by the last `LEARN` / `KEYINFO --list`.
-    pub known_keys: KnownKeys,
-    /// In-memory PIN cache. Cleared on RESTART and on bad-PIN errors.
+    /// Cards seen this session, with a `CardInfo` snapshot of each one read
+    /// so far. Serves prompts, KEYINFO and keygrip routing without
+    /// re-reading a card (each `read_card_info` costs ~3 seconds of
+    /// round-trips). LEARN --force re-reads the bound card.
+    pub cards: KnownCards,
+    /// In-memory PIN cache for the bound card. Cleared on bad-PIN errors
+    /// and when the session moves to another card.
     pub cached_pin: Option<CachedPin>,
-    /// Cached `CardInfo` from the last card read. Used to serve prompt
-    /// building, cardholder display, and signature-counter lookups without
-    /// re-reading the card (each `read_card_info` costs ~3 seconds of
-    /// round-trips). Refreshed explicitly on SERIALNO and LEARN --force.
-    pub cached_info: Option<CardInfo>,
-    /// Optional warm card handle kept across operations when
+    /// Optional warm handle to the bound card, kept across operations when
     /// `SCD_RS_CARD_POOL_TTL` is set. `None` = pooling disabled (every
     /// card op opens a fresh PC/SC handle).
     pub card_pool: Option<PooledCard>,
 }
 
 impl Session {
+    /// Bind the session to the card `ident`. Moving to a different card
+    /// drops the cached PIN and the pooled handle: both belong to the old
+    /// card, and sending its PIN to the new card would burn one of the new
+    /// card's PIN retries.
+    pub fn bind_card(&mut self, ident: &str) {
+        if self.current_ident.as_deref() == Some(ident) {
+            return;
+        }
+        if let Some(old) = &self.current_ident {
+            tracing::info!(from = %old, to = ident, "switching cards; dropping PIN cache and pool");
+        }
+        self.cached_pin = None;
+        self.card_pool = None;
+        self.current_ident = Some(ident.to_string());
+    }
+
     /// Return the cached PIN bytes if the cache is populated and unexpired.
     #[must_use]
     pub fn cached_pin_bytes(&self) -> Option<&[u8]> {
@@ -176,5 +153,56 @@ impl Session {
 
     pub fn take_data(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.setdata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scd_rs_card::test_support::pooled_card;
+
+    use super::*;
+    use crate::cards::fixtures::{NITROKEY, YUBIKEY};
+
+    /// A session bound to `ident` with a cached PIN and a pooled handle.
+    fn bound_session(ident: &str) -> Session {
+        Session {
+            current_ident: Some(ident.to_string()),
+            cached_pin: Some(CachedPin::new(b"123456".to_vec(), Duration::from_secs(600))),
+            card_pool: Some(pooled_card(ident)),
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn switching_cards_drops_pin_and_pool() {
+        let mut session = bound_session(YUBIKEY);
+        session.setdata = b"digest".to_vec();
+
+        session.bind_card(NITROKEY);
+
+        assert_eq!(session.current_ident.as_deref(), Some(NITROKEY));
+        assert!(session.cached_pin.is_none());
+        assert!(session.card_pool.is_none());
+        assert_eq!(session.setdata, b"digest", "SETDATA belongs to the next op");
+    }
+
+    #[test]
+    fn rebinding_the_same_card_keeps_pin_and_pool() {
+        let mut session = bound_session(NITROKEY);
+
+        session.bind_card(NITROKEY);
+
+        assert_eq!(session.cached_pin_bytes(), Some(&b"123456"[..]));
+        assert_eq!(
+            session.card_pool.as_ref().map(PooledCard::ident),
+            Some(NITROKEY)
+        );
+    }
+
+    #[test]
+    fn first_bind_sets_the_card() {
+        let mut session = Session::default();
+        session.bind_card(YUBIKEY);
+        assert_eq!(session.current_ident.as_deref(), Some(YUBIKEY));
     }
 }
